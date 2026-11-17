@@ -231,7 +231,9 @@ STEP_CENTRAL_BOILER_SCHEMA = vol.Schema(
     {
         vol.Optional(FLOW_ENABLED, default=False): cv.boolean,
         vol.Optional(FLOW_ENTITY): selector.EntitySelector(selector.EntitySelectorConfig(domain="number")),
-        vol.Optional(FLOW_SENSOR): selector.EntitySelector(selector.EntitySelectorConfig(domain="sensor", device_class="temperature")),
+        # Some Zigbee2MQTT water-temperature sensors expose Celsius without a
+        # temperature device class. The config flow still validates the unit.
+        vol.Optional(FLOW_SENSOR): selector.EntitySelector(selector.EntitySelectorConfig(domain="sensor")),
         vol.Optional(FLOW_MIN, default=35): vol.All(vol.Coerce(float), vol.Range(min=25, max=85)),
         vol.Optional(FLOW_MAX, default=65): vol.All(vol.Coerce(float), vol.Range(min=25, max=85)),
         vol.Optional(FLOW_REFERENCE, default=65): vol.All(vol.Coerce(float), vol.Range(min=25, max=85)),

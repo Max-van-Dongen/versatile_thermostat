@@ -57,7 +57,7 @@ flow. The feature is disabled by default.
 | Setting | Meaning |
 | --- | --- |
 | Boiler water flow setpoint | The boiler's Celsius `number` entity, not a TRV opening or room-temperature helper. |
-| Actual boiler flow sensor | Optional Celsius supply-water sensor. A configured sensor must report within 10 minutes. |
+| Actual boiler flow sensor | Optional Celsius supply-water sensor. Sensors without a temperature device class are also selectable. A configured sensor must report within 10 minutes. |
 | Minimum flow | Software lower bound, default 35 C. Use a value appropriate for your boiler and emitters. |
 | Maximum and reference | Set **both to the fixed flow temperature at which your present SmartPI model learned**, e.g. both 65 C or both 50 C. They must match in this implementation. |
 | Target valve opening | Default 70%. The most demanding room aims for this; quieter rooms can stay below it. Must be above the useful minimum of the valve curve. |
