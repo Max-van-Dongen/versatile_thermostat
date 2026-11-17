@@ -19,8 +19,11 @@ opening. All other rooms get independently compensated valve positions.
   the reference temperature.
 - Upward changes go directly to the required temperature on the next controller
   update. Downward changes are limited to 1 C/min, subject to the number entity's
-  step size. The reference is used on activation
-  for the configured settling period.
+  step size while heating continues.
+- Each new heating cycle starts directly at its current calculated temperature.
+  A low-demand restart after an overshoot does not first heat the water to the
+  reference. The same applies to the first activation with an already learned
+  SmartPI model. Calibration, high demand and other reference overrides still win.
 - The setpoint is reasserted every 60 seconds while heating. Zero-demand OFF
   commands and the existing activation delay remain effective. There is no new
   minimum-on time keeping the boiler running after the valves close.
@@ -63,7 +66,7 @@ flow. The feature is disabled by default.
 | Maximum and reference | Set **both to the fixed flow temperature at which your present SmartPI model learned**, e.g. both 65 C or both 50 C. They must match in this implementation. |
 | Target valve opening | Default 70%. The most demanding room aims for this; quieter rooms can stay below it. Must be above the useful minimum of the valve curve. |
 | Radiator exponent | Default 1.3. This is an approximate emission curve parameter. |
-| Settling time | Default 300 seconds. Model learning is only allowed at a settled reference temperature. |
+| Settling time | Default 300 seconds. Delays model learning at reference temperature; it does not force a reference-temperature startup hold. |
 
 Each participating room must use SmartPI and have **Used by central boiler**
 enabled. Direct valves and climates with direct valve regulation are supported.
@@ -102,7 +105,7 @@ requests the maximum/reference immediately. A valve at 100% because the water
 is cooler instead requests the temperature calculated from its reference heat
 demand and preferred valve opening. If that temperature is 48 C, the setpoint
 goes directly to 48 C rather than ramping up or automatically selecting maximum.
-Startup, calibration and other reference-required conditions still take priority.
+Calibration and other reference-required conditions still take priority.
 The periodic controller update runs every 60 seconds, with demand events able to
 trigger earlier updates; "immediately" means the next eligible update, not an
 instantaneous change in water temperature. Compensation continues to follow the
@@ -133,6 +136,14 @@ With an actual flow sensor, compensation follows the measured temperature.
 Without one, a 180-second first-order estimate follows commanded temperature so
 valves do not jump open immediately after a reduction. This estimate cannot prove
 the boiler reached its requested temperature. A sensor is preferable.
+
+On a restart, the new setpoint is chosen from current heat demand, while valve
+compensation still follows the actual water temperature. Without a sensor, the
+last estimate is retained conservatively across the OFF interval instead of
+assuming the water instantly reached the new setpoint. Learning remains paused
+at reduced flow. A reference-temperature restart must establish a fresh settling
+period once the measured or estimated water is near reference; idle time does not
+count toward heating-model settling.
 
 ## Diagnostics and failure behavior
 

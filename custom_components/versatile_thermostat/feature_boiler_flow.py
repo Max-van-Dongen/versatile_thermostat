@@ -40,7 +40,6 @@ class BoilerFlowManager:
         self.reason = "disabled"
         self._lock = asyncio.Lock()
         self._last_tick = None
-        self._changed_at = time.monotonic()
         self._last_sent = None
         self._last_written_target = None
         self._was_active = False
@@ -79,7 +78,7 @@ class BoilerFlowManager:
         if not self.sensor_id:
             return None
         state = self.hass.states.get(self.sensor_id)
-        if state is None or state.attributes.get("unit_of_measurement") != "°C":
+        if state is None or state.attributes.get("unit_of_measurement") != "�C":
             return None
         reported = getattr(state, "last_reported", state.last_updated)
         age = now_wall - reported.timestamp()
@@ -114,7 +113,7 @@ class BoilerFlowManager:
             self.can_heat = False
             state = self.hass.states.get(self.entity_id) if self.entity_id else None
             value = finite(state.state) if state else None
-            if state is None or value is None or not self.entity_id.startswith("number.") or state.attributes.get("unit_of_measurement") != "°C":
+            if state is None or value is None or not self.entity_id.startswith("number.") or state.attributes.get("unit_of_measurement") != "�C":
                 self._publish(now, None, False, "flow_entity_unavailable")
                 return
             device_min = finite(state.attributes.get("min"))
@@ -138,24 +137,15 @@ class BoilerFlowManager:
             if sensor_invalid:
                 desired, reason = self.settings.reference, "flow_sensor_unavailable"
 
-            startup = self.target is None or (active and not self._was_active)
-            if startup:
-                # A cold circuit must establish a known baseline before modulating.
-                self.target = self.settings.reference
-                self._estimated_flow = measured if measured is not None else self.target
-                self._changed_at = now
-                self._ramp_target = self.target
-            warmup = now - self._changed_at < self.settings.settle_seconds and startup
-            if not startup and active:
-                # Hold the reference for the first settling period after activation.
-                if now - getattr(self, "_activated_at", now) < self.settings.settle_seconds:
-                    desired, reason = self.settings.reference, "startup_settling"
+            starting = active and not self._was_active
+            if starting or self.target is None:
+                # A new heating cycle starts at its current heat requirement.
+                # Calibration and other reference overrides are in desired.
+                candidate = desired
+            elif active:
                 candidate = slew_flow(self._ramp_target if self._ramp_target is not None else self.target, desired, elapsed)
             else:
                 candidate = self.target
-            if startup:
-                self._activated_at = now
-                reason = "startup_settling"
 
             ramp_candidate = candidate
 
@@ -184,33 +174,35 @@ class BoilerFlowManager:
                         return
                     self._last_sent = now
                     self._last_written_target = candidate
-                if candidate != self.target:
-                    self._changed_at = now
                 self.target = candidate
                 self._ramp_target = ramp_candidate
             else:
                 # In particular, never overwrite a number=0 boiler OFF command.
                 self._last_sent = None
-                # The next activation starts at reference. Reset only the logical
-                # target while OFF so passive learning/manual calibration cannot
-                # remain blocked indefinitely after a modulated heating period.
+                # This is only an idle learning baseline, never a command or the
+                # next activation's setpoint. Each new cycle recalculates demand.
                 self.target = self.settings.reference
                 self._ramp_target = self.target
             self.can_heat = True
+            if active != self._was_active:
+                # Time spent OFF cannot qualify a new heating period for learning.
+                self._reference_since = None
             self._was_active = active
 
             if measured is not None:
                 self._estimated_flow = measured
-            elif active:
+            elif active and not starting:
                 # Conservative cooldown proxy: do not open valves instantly
                 # while radiators may still contain hotter water.
+                # On restart retain the last estimate: the new command has not
+                # yet heated or cooled the water during the previous OFF interval.
                 from math import exp
 
                 alpha = 1 - exp(-max(elapsed, 0) / 180)
                 self._estimated_flow += alpha * (self.target - self._estimated_flow)
             # At fixed reference flow, passive/cooling windows remain useful.
             # Requiring a hot sensor while OFF would deadlock bootstrap B learning.
-            at_reference = abs(self.target - self.settings.reference) < 0.01 and not sensor_invalid and (not active or measured is None or abs(measured - self.target) <= 2)
+            at_reference = abs(self.target - self.settings.reference) < 0.01 and not sensor_invalid and (not active or abs(self._estimated_flow - self.target) <= 2)
             if not at_reference:
                 self._reference_since = None
             elif self._reference_since is None:
@@ -219,8 +211,6 @@ class BoilerFlowManager:
             learning = settled and not sensor_invalid
             if not active:
                 reason = "idle"
-            elif warmup:
-                reason = "startup_settling"
             self._publish(now, self._estimated_flow, learning, reason)
 
     @property
