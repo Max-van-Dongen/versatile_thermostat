@@ -69,7 +69,9 @@ class BoilerFlowManager:
             request["room_temperature"] = getattr(zone, "current_temperature", None)
             current = finite(request["room_temperature"])
             target = finite(getattr(zone, "target_temperature", None))
-            if getattr(zone, "_safety_state", False) is True or current is None or target is None or target - current >= 0.5:
+            # SmartPI already includes the room-temperature deficit in its heat
+            # demand. Only faults add a coordinator-level reference override.
+            if getattr(zone, "_safety_state", False) is True or current is None or target is None:
                 request["reference_required"] = True
             requests.append(request)
         return requests

@@ -66,13 +66,18 @@ async def test_two_rooms_lower_flow_preserve_heat_and_raise_for_new_demand(hass,
             assert algo.linear_committed_on_percent == pytest.approx(demand)
             assert algo.est.save_state() == model
             assert algo._flow_learning_blocked
-        # An additional cold room must override the low-load selection.
+        # A colder target alone must not override SmartPI's calculated demand.
         zones[1].target_temperature = 22
-        algos[1]._set_linear_output(1)
         with patch("time.monotonic", return_value=4060):
             await manager.refresh(True)
+        assert manager.target == 30
+        assert manager.reason == "modulating"
+        # Full reference-temperature heat demand still raises the flow directly.
+        algos[1]._set_linear_output(1)
+        with patch("time.monotonic", return_value=4120):
+            await manager.refresh(True)
         assert manager.target == 50
-        assert manager.reason == "reference_required"
+        assert manager.reason == "modulating"
 
 
 async def test_unsupported_active_controller_forces_reference(hass):

@@ -14,7 +14,9 @@ opening. All other rooms get independently compensated valve positions.
 - Lower demand lowers flow temperature, down to the configured minimum.
 - Higher demand raises it, up to the calibration reference.
 - The most demanding room wins; demands are not averaged across rooms.
-- A room at least 0.5 C below its target requests the reference temperature.
+- Room-temperature deficits do not independently force reference temperature:
+  SmartPI already includes them in its calculated heat demand. A stable room
+  controller can therefore request cooler water while recovering toward target.
 - Active bootstrap/calibration and incompatible active controllers also request
   the reference temperature.
 - Upward changes go directly to the required temperature on the next controller
@@ -158,6 +160,8 @@ learning pause and reason. Existing valve diagnostics keep their meaning.
   and blocks learning. It does not assume the last sensor reading is current.
 - An expired coordinator context holds the last compensation and blocks learning.
 - An incompatible active room controller requests reference flow.
+- Invalid room/target temperatures and a room's active safety state also request
+  reference flow. SmartPI's own bootstrap/calibration overrides are retained.
 - OFF, sleeping and cooling rooms do not raise the heating flow request.
 
 The 60-second watchdog depends on Home Assistant running. It cannot provide

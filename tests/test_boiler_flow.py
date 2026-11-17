@@ -13,6 +13,7 @@ from custom_components.versatile_thermostat.boiler_flow import (
     FLOW_MIN,
     FLOW_MAX,
     FLOW_REFERENCE,
+    FLOW_OPENING,
     FlowSettings,
     choose_flow,
     slew_flow,
@@ -59,11 +60,77 @@ def test_invalid_settings_rejected(kwargs):
         FlowSettings(**kwargs)
 
 
-def build(hass, **extra):
+def build(hass, zones=None, **extra):
     hass.states.async_set("number.flow", "65", {"min": 0, "max": 80, "step": 1, "unit_of_measurement": "�C"})
     manager = BoilerFlowManager(hass, {FLOW_ENABLED: True, FLOW_ENTITY: "number.flow", **extra})
-    manager._requests = lambda: [request()]
+    if zones is None:
+        manager._requests = lambda: [request()]
+    else:
+        hass.data["climate"] = SimpleNamespace(entities=zones)
     return manager
+
+
+def recovery_zone(demand, room=19.5, target=20.5, *, reference_required=False):
+    """A compatible stable controller with an identity valve curve."""
+    return SimpleNamespace(
+        is_used_by_central_boiler=True,
+        hvac_mode="heat",
+        is_overpowering_detected=False,
+        is_device_active=True,
+        current_temperature=room,
+        target_temperature=target,
+        prop_algorithm=SimpleNamespace(
+            boiler_flow_protocol=1,
+            boiler_heat_request=lambda opening: request(demand, capacity=opening, reference_required=reference_required),
+        ),
+    )
+
+
+@pytest.mark.parametrize("room_target", [19.9, 20.0, 20.5, 23.5])
+async def test_recovery_uses_smartpi_demand_instead_of_room_temperature_deficit(hass, room_target):
+    zones = [recovery_zone(0.432, 19.5, room_target), recovery_zone(0.333, 19.6, room_target)]
+    manager = build(hass, zones=zones, **{FLOW_MAX: 55, FLOW_REFERENCE: 55, FLOW_OPENING: 90})
+    requests = manager._requests()
+    assert all(not zone["reference_required"] for zone in requests)
+    required, reason = choose_flow(manager.settings, requests)
+    assert required == pytest.approx(19.5 + 35.5 * (0.432 / 0.9) ** (1 / 1.3))
+    assert 39.5 < required < 40.5
+    assert reason == "modulating"
+    manager.target = 55
+    manager._ramp_target = 55
+    manager._was_active = True
+    manager._last_tick = 1000
+    with patch("homeassistant.core.ServiceRegistry.async_call", new_callable=AsyncMock):
+        for minute in range(1, 16):
+            with patch("custom_components.versatile_thermostat.feature_boiler_flow.time.monotonic", return_value=1000 + 60 * minute):
+                await manager.refresh(True)
+                assert manager.target == 55 - minute
+                assert manager.reason == "modulating"
+        # A real increase in calculated demand still raises flow immediately.
+        zones[0] = recovery_zone(1.0, 19.5, room_target)
+        with patch("custom_components.versatile_thermostat.feature_boiler_flow.time.monotonic", return_value=1960):
+            await manager.refresh(True)
+            assert manager.target == 55
+
+
+@pytest.mark.parametrize("fault", [{"_safety_state": True}, {"current_temperature": None}, {"current_temperature": float("nan")}, {"target_temperature": None}, {"target_temperature": float("nan")}])
+async def test_room_faults_still_require_reference_flow(hass, fault):
+    zone = recovery_zone(0.1)
+    zone.__dict__.update(fault)
+    manager = build(hass, zones=[zone], **{FLOW_MAX: 55, FLOW_REFERENCE: 55})
+    assert manager._requests()[0]["reference_required"]
+    with patch("homeassistant.core.ServiceRegistry.async_call", new_callable=AsyncMock):
+        await manager.refresh(True)
+    assert manager.target == 55
+    assert manager.reason == "reference_required"
+
+
+async def test_smartpi_reference_override_is_preserved_for_recovering_rooms(hass):
+    manager = build(hass, zones=[recovery_zone(0.1, reference_required=True)], **{FLOW_MAX: 55, FLOW_REFERENCE: 55})
+    with patch("homeassistant.core.ServiceRegistry.async_call", new_callable=AsyncMock):
+        await manager.refresh(True)
+    assert manager.target == 55
+    assert manager.reason == "reference_required"
 
 
 async def test_idle_never_writes_and_keepalive_recovers_external_override(hass):
