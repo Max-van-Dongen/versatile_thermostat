@@ -10,7 +10,7 @@
   ],
   "config_flow": true,
   "dependencies": [],
-  "documentation": "https://github.com/jmcollin78/versatile_thermostat",
+  "documentation": "https://github.com/Max-van-Dongen/versatile_thermostat",
   "homekit": {},
   "integration_type": "device",
   "iot_class": "calculated",
@@ -22,6 +22,6 @@
     "vtherm_api>=0.9.0"
   ],
   "ssdp": [],
-  "version": "10.6.6",
+  "version": "10.6.6.post1",
   "zeroconf": []
 }

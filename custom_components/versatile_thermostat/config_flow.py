@@ -750,6 +750,40 @@ class VersatileThermostatBaseConfigFlow(FlowHandler):
         )
 
         schema = STEP_CENTRAL_BOILER_SCHEMA
+        from .boiler_flow import FLOW_ENABLED, FLOW_ENTITY, FLOW_SENSOR, FlowSettings, finite
+
+        if user_input and user_input.get(FLOW_ENABLED):
+            try:
+                settings = FlowSettings.from_entry(user_input)
+                entity_id = user_input.get(FLOW_ENTITY, "")
+                state = self.hass.states.get(entity_id)
+                device_min = finite(state.attributes.get("min")) if state else None
+                device_max = finite(state.attributes.get("max")) if state else None
+                device_step = finite(state.attributes.get("step")) if state else None
+                if (
+                    not entity_id.startswith("number.")
+                    or state is None
+                    or state.attributes.get("unit_of_measurement") != "°C"
+                    or device_min is None
+                    or device_max is None
+                    or device_step is None
+                    or device_step <= 0
+                    or device_min > settings.minimum
+                    or device_max < settings.maximum
+                    or abs(device_min + round((settings.reference - device_min) / device_step) * device_step - settings.reference) > 1e-6
+                ):
+                    raise ValueError("Invalid Celsius flow number")
+                sensor = user_input.get(FLOW_SENSOR)
+                if sensor:
+                    sensor_state = self.hass.states.get(sensor)
+                    if sensor_state is None or sensor_state.attributes.get("unit_of_measurement") != "°C":
+                        raise ValueError("Invalid Celsius flow sensor")
+            except (ValueError, TypeError):
+                return self.async_show_form(
+                    step_id="central_boiler",
+                    data_schema=add_suggested_values_to_schema(schema, user_input),
+                    errors={"base": "boiler_flow_invalid"},
+                )
         next_step = self.async_step_menu
 
         return await self.generic_step("central_boiler", schema, user_input, next_step)

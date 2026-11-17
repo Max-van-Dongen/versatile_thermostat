@@ -1173,6 +1173,9 @@ async def test_update_central_boiler_state_simple_climate(
     assert total_power_active_sensor.active_device_ids == []
 
     # 2. stop a climate
+    # Match the mock's own sensor too: a queued set_temperature call otherwise
+    # recomputes HEATING from its stale 15 C reading and races the IDLE event.
+    climate1.set_current_temperature(25)
     await send_temperature_change_event(entity, 25, now)
     climate1.set_hvac_mode(VThermHvacMode_HEAT)
     climate1.set_hvac_action(HVACAction.IDLE)
@@ -1310,6 +1313,9 @@ async def test_update_central_boiler_state_simple_climate_power(
     assert total_power_active_sensor.active_device_ids == ["climate.climate1"]
 
     # 2. stop a climate
+    # Match the mock's own sensor too: a queued set_temperature call otherwise
+    # recomputes HEATING from its stale 15 C reading and races the IDLE event.
+    climate1.set_current_temperature(25)
     await send_temperature_change_event(entity, 25, now)
     climate1.set_hvac_mode(VThermHvacMode_HEAT)
     climate1.set_hvac_action(HVACAction.IDLE)

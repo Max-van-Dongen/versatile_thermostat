@@ -1,3 +1,5 @@
+> **Custom coordinated-flow fork:** Install both forks and see the [setup and control logic](https://github.com/Max-van-Dongen/versatile_thermostat/blob/main/documentation/en/coordinated-boiler-flow.md). This adds opt-in boiler water-temperature control with matching SmartPI valve compensation. Existing installations keep their behavior until enabled.
+
 [![GitHub Release][releases-shield]][releases]
 [![GitHub Activity][commits-shield]][commits]
 [![License][license-shield]](LICENSE)

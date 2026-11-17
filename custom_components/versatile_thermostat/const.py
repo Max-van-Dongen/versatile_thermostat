@@ -232,6 +232,8 @@ CONF_USE_LOCK_CENTRAL_CONFIG = "use_lock_central_config"
 
 CONF_USE_CENTRAL_MODE = "use_central_mode"
 
+from .boiler_flow import FLOW_KEYS
+
 CONF_CENTRAL_BOILER_ACTIVATION_SRV = "central_boiler_activation_service"
 CONF_CENTRAL_BOILER_DEACTIVATION_SRV = "central_boiler_deactivation_service"
 CONF_CENTRAL_BOILER_ACTIVATION_DELAY_SEC = "central_boiler_activation_delay_sec"
@@ -428,6 +430,7 @@ ALL_CONF = (
         CONF_CENTRAL_BOILER_DEACTIVATION_SRV,
         CONF_CENTRAL_BOILER_ACTIVATION_DELAY_SEC,
         CONF_KEEP_ALIVE_BOILER_DELAY_SEC,
+        *FLOW_KEYS,
         CONF_WINDOW_ACTION,
         CONF_STEP_TEMPERATURE,
         CONF_MIN_OPENING_DEGREES,

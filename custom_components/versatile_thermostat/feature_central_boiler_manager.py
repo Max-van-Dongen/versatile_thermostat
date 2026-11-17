@@ -1,5 +1,6 @@
 """This module manages the central boiler feature of the Versatile Thermostat integration."""
 
+import asyncio
 from datetime import timedelta
 from typing import Any
 
@@ -18,6 +19,7 @@ from homeassistant.helpers.event import (
 from homeassistant.helpers.template import Template
 
 from .base_manager import BaseFeatureManager
+from .feature_boiler_flow import BoilerFlowManager
 from .commons import check_and_extract_service_configuration, write_event_log
 from .const import *  # pylint: disable=wildcard-import, unused-wildcard-import
 from vtherm_api.log_collector import get_vtherm_logger
@@ -65,11 +67,14 @@ class FeatureCentralBoilerManager(BaseFeatureManager):
         # True while the VTherms are starting (HA startup, reload of all VTherms):
         # the demand sensors only see a part of the VTherms and a low value is not a real one
         self._vtherms_starting: bool = False
+        self._boiler_flow = BoilerFlowManager(hass, {})
+        self._command_lock = asyncio.Lock()
 
     @overrides
     def post_init(self, entry_infos: dict):
         """Reinit of the manager. Called at each reload: _is_on survives it, as the boiler device did not change"""
         existing_activation_commands = (self._service_activate, self._service_deactivate)
+        self._boiler_flow = BoilerFlowManager(self._hass, entry_infos)
         self._service_activate = check_and_extract_service_configuration(
             entry_infos.get(CONF_CENTRAL_BOILER_ACTIVATION_SRV)
         )
@@ -107,6 +112,9 @@ class FeatureCentralBoilerManager(BaseFeatureManager):
                 boiler_entity_ids,
             )
             self.add_listener(listener_cancel)
+
+            if self._boiler_flow.enabled:
+                self.add_listener(async_track_time_interval(self._hass, self.calculate_central_boiler_state, timedelta(seconds=60)))
 
             # Add periodic keep-alive if delay is configured
             if self._keep_alive_boiler_state_enabled:
@@ -162,11 +170,23 @@ class FeatureCentralBoilerManager(BaseFeatureManager):
         return self._is_on
 
     @property
+    def boiler_flow(self):
+        """The optional temperature coordinator and its plugin context."""
+        return self._boiler_flow
+
+    @property
     def is_detected(self) -> bool:
         """Return True if the central boiler is detected"""
         return self._is_on if self._is_on is not None else False
 
     async def calculate_central_boiler_state(self, _):
+        """Serialize demand events, delayed activation and keep-alive commands."""
+        if not self._boiler_flow.enabled:
+            return await self._calculate_central_boiler_state(_)
+        async with self._command_lock:
+            return await self._calculate_central_boiler_state(_)
+
+    async def _calculate_central_boiler_state(self, _):
         """Calculate the central boiler state depending on all VTherm that
         controls this central boiler"""
 
@@ -198,6 +218,17 @@ class FeatureCentralBoilerManager(BaseFeatureManager):
                 self._wait_for_boiler_command_entity(self._service_activate)
                 return
 
+            await self._boiler_flow.refresh(True, force=True)
+            if not self._boiler_flow.can_heat:
+                return
+            if self._boiler_flow.enabled and not (self.is_nb_active_active_for_boiler_exceeded or self.is_total_power_active_for_boiler_exceeded):
+                # The flow write awaited I/O; all valves may have closed meanwhile.
+                await self.call_service(self._service_deactivate)
+                self._is_on = False
+                self._last_activated_service = self._service_deactivate if self._keep_alive_boiler_state_enabled else None
+                _send_vtherm_event(data={"central_boiler": False})
+                return
+
             _LOGGER.info("%s - central boiler will be turned on", self)
             try:
                 await self.call_service(self._service_activate)
@@ -220,6 +251,12 @@ class FeatureCentralBoilerManager(BaseFeatureManager):
                 )
                 return
 
+        async def _activate_delayed(event):
+            if not self._boiler_flow.enabled:
+                return await _activate_later(event)
+            async with self._command_lock:
+                await _activate_later(event)
+
         if not self.is_ready:
             _LOGGER.warning(
                 "%s - the central boiler manager is not ready. Central boiler state cannot be calculated",
@@ -232,6 +269,13 @@ class FeatureCentralBoilerManager(BaseFeatureManager):
             return
 
         active = self.is_nb_active_active_for_boiler_exceeded or self.is_total_power_active_for_boiler_exceeded
+
+        # A number.set_value flow command can itself enable a boiler. Preserve
+        # the activation delay: the first write belongs in _activate_later.
+        await self._boiler_flow.refresh(active and self._is_on is True)
+        active = active and self._boiler_flow.can_heat
+        if self._boiler_flow.enabled:
+            await self.refresh_central_boiler_custom_attributes()
 
         if not active:
             self._activation_delay_elapsed = False
@@ -253,7 +297,7 @@ class FeatureCentralBoilerManager(BaseFeatureManager):
                         return
 
                     if self._activation_delay_sec > 0 and not self._activation_delay_elapsed:
-                        self._call_later_handle = async_call_later(self._hass, timedelta(seconds=self._activation_delay_sec), _activate_later)
+                        self._call_later_handle = async_call_later(self._hass, timedelta(seconds=self._activation_delay_sec), _activate_delayed)
                         _send_vtherm_event(
                             data={"delayed_activation_sec": self._activation_delay_sec},
                         )
@@ -345,9 +389,19 @@ class FeatureCentralBoilerManager(BaseFeatureManager):
         await self.calculate_central_boiler_state(None)
 
     async def _keep_alive_boiler(self, _=None):
+        """Serialize keep-alive with state transitions so OFF cannot be overtaken."""
+        if not self._boiler_flow.enabled:
+            return await self._keep_alive_boiler_locked(_)
+        async with self._command_lock:
+            await self._keep_alive_boiler_locked(_)
+
+    async def _keep_alive_boiler_locked(self, _=None):
         """Send keep-alive command to maintain boiler state (called periodically if delay is configured)"""
         if self._keep_alive_boiler_delay_sec <= 0:
             return
+
+        if self._boiler_flow.enabled:
+            await self._calculate_central_boiler_state(None)
 
         # If we have a pending activation (after delay), don't send keep-alive yet
         if self._call_later_handle is not None:
@@ -388,6 +442,18 @@ class FeatureCentralBoilerManager(BaseFeatureManager):
                     f"The service {service_config['service_domain']}.{service_config['service_name']} is not called"
                 ) from err
 
+        # A direct number activation may have an old fixed value in its service
+        # configuration. Substitute the coordinated value, but never touch OFF.
+        if (
+            self._boiler_flow.enabled
+            and service_config is self._service_activate
+            and service_config.get("entity_id") == self._boiler_flow.entity_id
+            and service_config.get("service_domain") == "number"
+            and service_config.get("service_name") == "set_value"
+            and self._boiler_flow.target is not None
+        ):
+            service_data = {**service_data, "value": self._boiler_flow.target}
+
         _LOGGER.debug(
             "%s - Calling central boiler service %s with data %s",
             self,
@@ -401,6 +467,7 @@ class FeatureCentralBoilerManager(BaseFeatureManager):
             target={
                 "entity_id": service_config["entity_id"],
             },
+            **({"blocking": True} if self._boiler_flow.enabled else {}),
         )
 
     async def reload_central_boiler_binary_listener(self):
@@ -438,6 +505,7 @@ class FeatureCentralBoilerManager(BaseFeatureManager):
                         "service_activate": self._service_activate,
                         "service_deactivate": self._service_deactivate,
                         "keep_alive_boiler_delay_sec": self._keep_alive_boiler_delay_sec,
+                        "dynamic_flow": self._boiler_flow.diagnostics,
                     }
                 }
             )

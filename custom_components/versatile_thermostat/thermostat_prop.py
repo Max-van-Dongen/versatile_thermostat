@@ -62,6 +62,17 @@ class ThermostatProp(BaseThermostat[T], Generic[T]):
         return self._prop_algorithm
 
     @property
+    def boiler_flow_context(self):
+        """Versioned context for flow-aware plugins; None preserves legacy control."""
+        if not self.is_used_by_central_boiler:
+            return None
+        from .vtherm_central_api import VersatileThermostatAPI
+
+        api = VersatileThermostatAPI.get_vtherm_api(self.hass)
+        manager = api.central_boiler_manager if api else None
+        return manager.boiler_flow.context if manager and manager.boiler_flow.enabled else None
+
+    @property
     def on_percent(self) -> float | None:
         """Returns the percentage the heater must be ON
         In safety mode this value is overridden with the _default_on_percent.

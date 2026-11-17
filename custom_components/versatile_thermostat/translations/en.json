@@ -273,7 +273,16 @@
                     "central_boiler_activation_service": "Command to turn-on",
                     "central_boiler_deactivation_service": "Command to turn-off",
                     "central_boiler_activation_delay_sec": "Activation delay (seconds)",
-                    "keep_alive_boiler_delay_sec": "Keep-alive delay (seconds)"
+                    "keep_alive_boiler_delay_sec": "Keep-alive delay (seconds)",
+                    "boiler_flow_enabled": "Enable coordinated boiler flow (requires matching SmartPI fork)",
+                    "boiler_flow_entity": "Boiler water flow setpoint (Celsius number entity)",
+                    "boiler_flow_sensor": "Actual boiler flow temperature sensor (optional, Celsius)",
+                    "boiler_flow_min": "Minimum flow temperature (°C)",
+                    "boiler_flow_max": "Maximum flow temperature (must equal reference, °C)",
+                    "boiler_flow_reference": "Temperature used for SmartPI calibration (°C)",
+                    "boiler_flow_target_opening": "Target opening of the most demanding valve (%)",
+                    "boiler_flow_exponent": "Radiator temperature exponent",
+                    "boiler_flow_settle_seconds": "Settling time before reference-temperature learning (seconds)"
                 },
                 "data_description": {
                     "central_boiler_activation_service": "Command to turn-on the central boiler formatted like entity_id/service_name[/attribut:valeur]",
@@ -413,7 +422,8 @@
             "max_opening_degrees_format": "A comma separated list of positive integer between 0 and the max valve opening is expected. Example: 80, 85, 90",
             "min_max_opening_degrees_inconsistent": "For each underlying device, max_opening_degrees must be strictly greater than min_opening_degrees. Please check your configuration.",
             "valve_control_parameters_cardinality_incorrect": "The minimum and maximum opening degree lists cannot contain more values than the configured valves",
-            "vswitch_configuration_incorrect": "The command customization configuration is incorrect. It is required for underlying entities that are not switches, and the format must be service_name[/attribute:value]. More information is available in the README"
+            "vswitch_configuration_incorrect": "The command customization configuration is incorrect. It is required for underlying entities that are not switches, and the format must be service_name[/attribute:value]. More information is available in the README",
+            "boiler_flow_invalid": "Use a Celsius number whose range covers the configured temperatures. Minimum must not exceed maximum; maximum must equal the calibration reference. Optional flow sensor must report Celsius."
         },
         "abort": {
             "already_configured": "Device is already configured"
