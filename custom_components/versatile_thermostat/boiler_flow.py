@@ -89,6 +89,8 @@ def choose_flow(settings: FlowSettings, requests: list[dict]) -> tuple[float, st
 
 
 def slew_flow(current: float, desired: float, elapsed: float) -> float:
-    """Rise at 3 C/min and fall at 1 C/min; no accumulated jump after downtime."""
+    """Meet higher demand immediately; fall at 1 C/min without downtime jumps."""
+    if desired >= current:
+        return desired
     minutes = min(max(elapsed, 0), 60) / 60
-    return min(current + 3 * minutes, max(current - minutes, desired))
+    return max(current - minutes, desired)

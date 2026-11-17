@@ -43,11 +43,13 @@ def test_invalid_demands_fall_back_to_reference(bad):
     assert choose_flow(FlowSettings(), [request(bad)]) == (65, "invalid_demand")
 
 
-def test_calibration_holds_reference_and_ramp_is_bounded():
+def test_calibration_holds_reference_and_only_downward_ramp_is_limited():
     assert choose_flow(FlowSettings(), [request(0.05, reference_required=True)])[0] == 65
     assert slew_flow(50, 35, 60) == 49
-    assert slew_flow(35, 65, 60) == 38
-    assert slew_flow(35, 65, 3600) == 38
+    assert slew_flow(35, 65, 60) == 65
+    assert slew_flow(35, 65, 3600) == 65
+    assert slew_flow(35, 48, 0) == 48
+    assert slew_flow(50, 35, 3600) == 49
     assert slew_flow(50, 35, 0) == 50
 
 
@@ -58,7 +60,7 @@ def test_invalid_settings_rejected(kwargs):
 
 
 def build(hass, **extra):
-    hass.states.async_set("number.flow", "65", {"min": 0, "max": 80, "step": 1, "unit_of_measurement": "°C"})
+    hass.states.async_set("number.flow", "65", {"min": 0, "max": 80, "step": 1, "unit_of_measurement": "�C"})
     manager = BoilerFlowManager(hass, {FLOW_ENABLED: True, FLOW_ENTITY: "number.flow", **extra})
     manager._requests = lambda: [request()]
     return manager
@@ -98,7 +100,7 @@ async def test_failed_write_does_not_publish_compensated_context(hass):
 
 async def test_unavailable_and_invalid_unit_are_rejected(hass):
     manager = build(hass)
-    for state, unit in [("unavailable", "°C"), ("nan", "°C"), ("65", "°F")]:
+    for state, unit in [("unavailable", "�C"), ("nan", "�C"), ("65", "�F")]:
         hass.states.async_set("number.flow", state, {"unit_of_measurement": unit})
         await manager.refresh(True, force=True)
         assert not manager.can_heat
@@ -114,7 +116,7 @@ async def test_sensor_failure_restores_reference_without_learning(hass):
     with patch("homeassistant.core.ServiceRegistry.async_call", new_callable=AsyncMock):
         with patch("custom_components.versatile_thermostat.feature_boiler_flow.time.monotonic", return_value=1060):
             await manager.refresh(True)
-    assert manager.target == 38
+    assert manager.target == 65
     assert manager.reason == "flow_sensor_unavailable"
     assert manager.context["learning_allowed"] is False
 
@@ -122,13 +124,13 @@ async def test_sensor_failure_restores_reference_without_learning(hass):
 async def test_measured_flow_is_used_and_reference_learning_requires_settling(hass):
     manager = build(hass, **{FLOW_SENSOR: "sensor.flow"})
     manager._requests = lambda: [request(1)]
-    hass.states.async_set("sensor.flow", 45, {"unit_of_measurement": "°C"})
+    hass.states.async_set("sensor.flow", 45, {"unit_of_measurement": "�C"})
     with patch("homeassistant.core.ServiceRegistry.async_call", new_callable=AsyncMock):
         with patch("custom_components.versatile_thermostat.feature_boiler_flow.time.monotonic", return_value=1000):
             await manager.refresh(True)
             assert manager.context["flow_temperature"] == 45
             assert not manager.context["learning_allowed"]
-        hass.states.async_set("sensor.flow", 65, {"unit_of_measurement": "°C"})
+        hass.states.async_set("sensor.flow", 65, {"unit_of_measurement": "�C"})
         with patch("custom_components.versatile_thermostat.feature_boiler_flow.time.monotonic", return_value=1360):
             await manager.refresh(True)
             assert not manager.context["learning_allowed"]
@@ -149,6 +151,26 @@ async def test_frequent_events_accumulate_sub_step_ramp_changes(hass):
             with patch("custom_components.versatile_thermostat.feature_boiler_flow.time.monotonic", return_value=tick):
                 await manager.refresh(True)
     assert manager.target == 49
+
+
+@pytest.mark.parametrize("demand, expected", [(1.0, 55), (0.7 * (28 / 35) ** 1.3, 48)])
+async def test_rising_demand_sets_required_flow_immediately_using_measured_water(hass, demand, expected):
+    manager = build(hass, **{FLOW_MAX: 55, FLOW_REFERENCE: 55, FLOW_SENSOR: "sensor.flow"})
+    manager._requests = lambda: [request(demand)]
+    manager.target = 40
+    manager._ramp_target = 40
+    manager._was_active = True
+    manager._activated_at = 0
+    manager._last_tick = 1000
+    hass.states.async_set("sensor.flow", 40, {"unit_of_measurement": "�C"})
+    with patch("homeassistant.core.ServiceRegistry.async_call", new_callable=AsyncMock) as calls:
+        with patch("custom_components.versatile_thermostat.feature_boiler_flow.time.monotonic", return_value=1005):
+            await manager.refresh(True)
+    assert manager.target == expected
+    assert calls.call_args.args[2] == {"value": expected}
+    # Raising the command does not pretend that the circuit is already hotter.
+    assert manager.context["flow_temperature"] == 40
+    assert not manager.context["learning_allowed"]
 
 
 async def test_number_activation_obeys_delay_and_closed_valves_switch_off(hass):
@@ -187,7 +209,7 @@ async def test_number_activation_obeys_delay_and_closed_valves_switch_off(hass):
 
 async def test_flow_sensor_timestamp_must_be_fresh(hass):
     manager = build(hass, **{FLOW_SENSOR: "sensor.flow"})
-    hass.states.async_set("sensor.flow", 50, {"unit_of_measurement": "°C"})
+    hass.states.async_set("sensor.flow", 50, {"unit_of_measurement": "�C"})
     now = datetime.now(timezone.utc).timestamp()
     assert manager._measured_flow(now) == 50
     assert manager._measured_flow(now + 601) is None
@@ -235,7 +257,7 @@ async def test_demand_disappearing_during_flow_write_cannot_enable_boiler(hass):
 
 async def test_reference_must_be_representable_on_actuator_grid(hass):
     manager = build(hass)
-    hass.states.async_set("number.flow", 64, {"min": 0, "max": 80, "step": 2, "unit_of_measurement": "°C"})
+    hass.states.async_set("number.flow", 64, {"min": 0, "max": 80, "step": 2, "unit_of_measurement": "�C"})
     with patch("homeassistant.core.ServiceRegistry.async_call", new_callable=AsyncMock) as calls:
         await manager.refresh(True)
         calls.assert_not_called()

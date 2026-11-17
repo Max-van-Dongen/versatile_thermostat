@@ -17,8 +17,9 @@ opening. All other rooms get independently compensated valve positions.
 - A room at least 0.5 C below its target requests the reference temperature.
 - Active bootstrap/calibration and incompatible active controllers also request
   the reference temperature.
-- Upward changes are limited to 3 C/min and downward changes to 1 C/min,
-  subject to the number entity's step size. The reference is used on activation
+- Upward changes go directly to the required temperature on the next controller
+  update. Downward changes are limited to 1 C/min, subject to the number entity's
+  step size. The reference is used on activation
   for the configured settling period.
 - The setpoint is reasserted every 60 seconds while heating. Zero-demand OFF
   commands and the existing activation delay remain effective. There is no new
@@ -96,7 +97,18 @@ realized_heat = C(applied_valve_position) * capacity(actual_or_estimated_flow)
 ```
 
 VTherm takes the maximum required flow across rooms, clamps it to the configured
-bounds and applies the rate limit. SmartPI saturates the valve at its allowed
+bounds and limits only downward changes. A 100% reference-temperature demand
+requests the maximum/reference immediately. A valve at 100% because the water
+is cooler instead requests the temperature calculated from its reference heat
+demand and preferred valve opening. If that temperature is 48 C, the setpoint
+goes directly to 48 C rather than ramping up or automatically selecting maximum.
+Startup, calibration and other reference-required conditions still take priority.
+The periodic controller update runs every 60 seconds, with demand events able to
+trigger earlier updates; "immediately" means the next eligible update, not an
+instantaneous change in water temperature. Compensation continues to follow the
+measured or estimated water temperature as the circuit warms.
+
+SmartPI saturates the valve at its allowed
 opening and accounts for the reduced available heat in its anti-windup limit.
 Feedback uses the same conversion as commands, so a larger valve opening at a
 lower flow is not mistaken for more reference-temperature heat.
@@ -131,7 +143,7 @@ learning pause and reason. Existing valve diagnostics keep their meaning.
 
 - Missing/invalid flow actuator or a failed service write prevents a new heating
   activation. A running boiler is deactivated by its existing OFF service.
-- A missing/stale configured water sensor requests a gradual return to reference
+- A missing/stale configured water sensor requests a direct return to reference
   and blocks learning. It does not assume the last sensor reading is current.
 - An expired coordinator context holds the last compensation and blocks learning.
 - An incompatible active room controller requests reference flow.

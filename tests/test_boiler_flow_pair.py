@@ -36,7 +36,7 @@ async def test_two_rooms_lower_flow_preserve_heat_and_raise_for_new_demand(hass,
             )
         )
     hass.data["climate"] = SimpleNamespace(entities=zones)
-    hass.states.async_set("number.flow", 50, {"min": 0, "max": 80, "step": 1, "unit_of_measurement": "°C"})
+    hass.states.async_set("number.flow", 50, {"min": 0, "max": 80, "step": 1, "unit_of_measurement": "�C"})
     manager = BoilerFlowManager(
         hass,
         {
@@ -71,7 +71,7 @@ async def test_two_rooms_lower_flow_preserve_heat_and_raise_for_new_demand(hass,
         algos[1]._set_linear_output(1)
         with patch("time.monotonic", return_value=4060):
             await manager.refresh(True)
-        assert manager.target == 33
+        assert manager.target == 50
         assert manager.reason == "reference_required"
 
 
