@@ -36,7 +36,7 @@ async def test_two_rooms_lower_flow_preserve_heat_and_raise_for_new_demand(hass,
             )
         )
     hass.data["climate"] = SimpleNamespace(entities=zones)
-    hass.states.async_set("number.flow", 50, {"min": 0, "max": 80, "step": 1, "unit_of_measurement": "�C"})
+    hass.states.async_set("number.flow", 50, {"min": 0, "max": 80, "step": 1, "unit_of_measurement": "\u00b0C"})
     manager = BoilerFlowManager(
         hass,
         {

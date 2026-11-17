@@ -4,6 +4,7 @@ import asyncio
 import time
 from math import ceil, floor
 
+from homeassistant.const import UnitOfTemperature
 from homeassistant.exceptions import HomeAssistantError
 from vtherm_api.log_collector import get_vtherm_logger
 
@@ -80,7 +81,7 @@ class BoilerFlowManager:
         if not self.sensor_id:
             return None
         state = self.hass.states.get(self.sensor_id)
-        if state is None or state.attributes.get("unit_of_measurement") != "�C":
+        if state is None or state.attributes.get("unit_of_measurement") != UnitOfTemperature.CELSIUS:
             return None
         reported = getattr(state, "last_reported", state.last_updated)
         age = now_wall - reported.timestamp()
@@ -115,7 +116,7 @@ class BoilerFlowManager:
             self.can_heat = False
             state = self.hass.states.get(self.entity_id) if self.entity_id else None
             value = finite(state.state) if state else None
-            if state is None or value is None or not self.entity_id.startswith("number.") or state.attributes.get("unit_of_measurement") != "�C":
+            if state is None or value is None or not self.entity_id.startswith("number.") or state.attributes.get("unit_of_measurement") != UnitOfTemperature.CELSIUS:
                 self._publish(now, None, False, "flow_entity_unavailable")
                 return
             device_min = finite(state.attributes.get("min"))
