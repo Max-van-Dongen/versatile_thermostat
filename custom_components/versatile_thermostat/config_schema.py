@@ -2,7 +2,11 @@
 
 import voluptuous as vol
 
-from .boiler_flow import FLOW_ENABLED, FLOW_ENTITY, FLOW_SENSOR, FLOW_MIN, FLOW_MAX, FLOW_REFERENCE, FLOW_OPENING, FLOW_EXPONENT, FLOW_SETTLE
+from .boiler_flow import (
+    FLOW_ENABLED, FLOW_ENTITY, FLOW_SENSOR, FLOW_MIN, FLOW_MAX, FLOW_REFERENCE,
+    FLOW_OPENING, FLOW_EXPONENT, FLOW_SETTLE, PULSE_ENABLED, PULSE_FLAME, PULSE_GAS_RATE,
+    PULSE_OVERSHOOT, PULSE_UNDERSHOOT,
+)
 
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers import selector
@@ -240,6 +244,11 @@ STEP_CENTRAL_BOILER_SCHEMA = vol.Schema(
         vol.Optional(FLOW_OPENING, default=70): vol.All(vol.Coerce(float), vol.Range(min=10, max=100)),
         vol.Optional(FLOW_EXPONENT, default=1.3): vol.All(vol.Coerce(float), vol.Range(min=1, max=2)),
         vol.Optional(FLOW_SETTLE, default=300): vol.All(vol.Coerce(float), vol.Range(min=60, max=3600)),
+        vol.Optional(PULSE_ENABLED, default=False): cv.boolean,
+        vol.Optional(PULSE_OVERSHOOT, default=0.2): vol.All(vol.Coerce(float), vol.Range(min=0.1, max=1.0)),
+        vol.Optional(PULSE_UNDERSHOOT, default=0.1): vol.All(vol.Coerce(float), vol.Range(min=0.1, max=1.0)),
+        vol.Optional(PULSE_FLAME): selector.EntitySelector(selector.EntitySelectorConfig(domain="binary_sensor")),
+        vol.Optional(PULSE_GAS_RATE): selector.EntitySelector(selector.EntitySelectorConfig(domain="sensor")),
         vol.Required(CONF_CENTRAL_BOILER_ACTIVATION_DELAY_SEC, default=0): selector.NumberSelector(
             selector.NumberSelectorConfig(min=0, max=600, step=10, mode=selector.NumberSelectorMode.BOX)
         ),

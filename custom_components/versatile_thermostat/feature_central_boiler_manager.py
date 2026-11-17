@@ -74,6 +74,8 @@ class FeatureCentralBoilerManager(BaseFeatureManager):
     def post_init(self, entry_infos: dict):
         """Reinit of the manager. Called at each reload: _is_on survives it, as the boiler device did not change"""
         existing_activation_commands = (self._service_activate, self._service_deactivate)
+        if self._boiler_flow.pulse:
+            self._boiler_flow.pulse.stop()
         self._boiler_flow = BoilerFlowManager(self._hass, entry_infos)
         self._service_activate = check_and_extract_service_configuration(
             entry_infos.get(CONF_CENTRAL_BOILER_ACTIVATION_SRV)
@@ -114,7 +116,13 @@ class FeatureCentralBoilerManager(BaseFeatureManager):
             self.add_listener(listener_cancel)
 
             if self._boiler_flow.enabled:
-                self.add_listener(async_track_time_interval(self._hass, self.calculate_central_boiler_state, timedelta(seconds=60)))
+                pulse = self._boiler_flow.pulse
+                self.add_listener(async_track_time_interval(self._hass, self.calculate_central_boiler_state, timedelta(seconds=15 if pulse else 60)))
+                # Flame transitions can be shorter than the polling interval.
+                if pulse and pulse.burner_sensor:
+                    self.add_listener(async_track_state_change_event(
+                        self._hass, [pulse.burner_sensor], self.calculate_central_boiler_state,
+                    ))
 
             # Add periodic keep-alive if delay is configured
             if self._keep_alive_boiler_state_enabled:
@@ -139,6 +147,11 @@ class FeatureCentralBoilerManager(BaseFeatureManager):
     def stop_listening(self) -> bool:
         """Stop all listeners, including the one which waits for the boiler command entity"""
         self._stop_waiting_for_boiler_command_entity()
+        if self._boiler_flow.pulse:
+            self._boiler_flow.pulse.stop()
+            if self._call_later_handle:
+                self._call_later_handle()
+                self._call_later_handle = None
         return super().stop_listening()
 
     def notify_vtherms_starting(self) -> None:
@@ -186,6 +199,10 @@ class FeatureCentralBoilerManager(BaseFeatureManager):
         async with self._command_lock:
             return await self._calculate_central_boiler_state(_)
 
+    def _heating_requested(self):
+        active = self.is_nb_active_active_for_boiler_exceeded or self.is_total_power_active_for_boiler_exceeded
+        return self._boiler_flow.plan_pulse(active, self._is_on)
+
     async def _calculate_central_boiler_state(self, _):
         """Calculate the central boiler state depending on all VTherm that
         controls this central boiler"""
@@ -207,7 +224,7 @@ class FeatureCentralBoilerManager(BaseFeatureManager):
                 self._call_later_handle = None
 
             # the condition may have changed during the delay, so we check it again before activating the boiler
-            active = self.is_nb_active_active_for_boiler_exceeded or self.is_total_power_active_for_boiler_exceeded
+            active = self._is_demand_known() and self._heating_requested()
             if not active:
                 _LOGGER.info("%s - central boiler delayed activation cancelled because condition is not valid anymore", self)
                 return
@@ -221,10 +238,12 @@ class FeatureCentralBoilerManager(BaseFeatureManager):
             await self._boiler_flow.refresh(True, force=True)
             if not self._boiler_flow.can_heat:
                 return
-            if self._boiler_flow.enabled and not (self.is_nb_active_active_for_boiler_exceeded or self.is_total_power_active_for_boiler_exceeded):
+            if self._boiler_flow.enabled and not (self._is_demand_known() and self._heating_requested() and self._boiler_flow.pulse_permits_heat()):
                 # The flow write awaited I/O; all valves may have closed meanwhile.
                 await self.call_service(self._service_deactivate)
                 self._is_on = False
+                if self._boiler_flow.pulse:
+                    self._boiler_flow.pulse.set_boiler_on(False)
                 self._last_activated_service = self._service_deactivate if self._keep_alive_boiler_state_enabled else None
                 _send_vtherm_event(data={"central_boiler": False})
                 return
@@ -234,6 +253,8 @@ class FeatureCentralBoilerManager(BaseFeatureManager):
                 await self.call_service(self._service_activate)
                 _LOGGER.info("%s - central boiler have been turned on after delay", self)
                 self._is_on = True
+                if self._boiler_flow.pulse:
+                    self._boiler_flow.pulse.set_boiler_on(True)
                 self._activation_delay_elapsed = False
                 self._stop_waiting_for_boiler_command_entity()
                 if self._keep_alive_boiler_state_enabled:
@@ -268,17 +289,20 @@ class FeatureCentralBoilerManager(BaseFeatureManager):
             _LOGGER.debug("%s - the demand is not known yet. Central boiler state is not calculated", self)
             return
 
-        active = self.is_nb_active_active_for_boiler_exceeded or self.is_total_power_active_for_boiler_exceeded
+        active = self._heating_requested()
 
         # A number.set_value flow command can itself enable a boiler. Preserve
         # the activation delay: the first write belongs in _activate_later.
         await self._boiler_flow.refresh(active and self._is_on is True)
-        active = active and self._boiler_flow.can_heat
+        active = active and self._boiler_flow.can_heat and self._boiler_flow.pulse_permits_heat()
         if self._boiler_flow.enabled:
             await self.refresh_central_boiler_custom_attributes()
 
         if not active:
             self._activation_delay_elapsed = False
+            if self._boiler_flow.pulse and self._call_later_handle:
+                self._call_later_handle()
+                self._call_later_handle = None
 
         if self._is_on == active:
             # Nothing to send anymore, even if a command was waiting for the boiler command entity
@@ -324,6 +348,8 @@ class FeatureCentralBoilerManager(BaseFeatureManager):
                     await self.call_service(self._service_deactivate)
                     _LOGGER.info("%s - central boiler have been turned off", self)
                     self._is_on = active
+                    if self._boiler_flow.pulse:
+                        self._boiler_flow.pulse.set_boiler_on(False)
                     self._stop_waiting_for_boiler_command_entity()
                     if self._keep_alive_boiler_state_enabled:
                         self._last_activated_service = self._service_deactivate
@@ -409,6 +435,12 @@ class FeatureCentralBoilerManager(BaseFeatureManager):
 
         # Send keep-alive command for the last activated service
         if self._last_activated_service:
+            if (self._boiler_flow.pulse and self._last_activated_service is self._service_activate
+                    and (not self._is_demand_known()
+                         or not (self.is_nb_active_active_for_boiler_exceeded or self.is_total_power_active_for_boiler_exceeded)
+                         or not self._boiler_flow.can_heat
+                         or not self._boiler_flow.pulse_permits_heat())):
+                return
             try:
                 await self.call_service(self._last_activated_service)
                 entity_id = self._last_activated_service.get("entity_id", "unknown")

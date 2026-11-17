@@ -750,7 +750,33 @@ class VersatileThermostatBaseConfigFlow(FlowHandler):
         )
 
         schema = STEP_CENTRAL_BOILER_SCHEMA
-        from .boiler_flow import FLOW_ENABLED, FLOW_ENTITY, FLOW_SENSOR, FlowSettings, finite
+        from .boiler_flow import (
+            FLOW_ENABLED, FLOW_ENTITY, FLOW_SENSOR, PULSE_ENABLED, PULSE_FLAME,
+            PULSE_GAS_RATE, PULSE_GAS_RATE_UNITS, FlowSettings, finite,
+        )
+
+        if user_input and user_input.get(PULSE_ENABLED):
+            flame_id = user_input.get(PULSE_FLAME)
+            gas_rate_id = user_input.get(PULSE_GAS_RATE)
+            errors = {}
+            if not user_input.get(FLOW_ENABLED) or not user_input.get(FLOW_SENSOR):
+                errors[PULSE_ENABLED] = "pulse_requires_flow"
+            if flame_id and (not flame_id.startswith("binary_sensor.") or self.hass.states.get(flame_id) is None):
+                errors[PULSE_FLAME] = "unknown_entity"
+            if gas_rate_id:
+                gas_state = self.hass.states.get(gas_rate_id)
+                if flame_id:
+                    errors[PULSE_GAS_RATE] = "pulse_one_burner_sensor"
+                elif not gas_rate_id.startswith("sensor.") or gas_state is None:
+                    errors[PULSE_GAS_RATE] = "unknown_entity"
+                elif gas_state.attributes.get("unit_of_measurement") not in PULSE_GAS_RATE_UNITS:
+                    errors[PULSE_GAS_RATE] = "pulse_gas_unit"
+            if errors:
+                return self.async_show_form(
+                    step_id="central_boiler",
+                    data_schema=add_suggested_values_to_schema(schema, user_input),
+                    errors=errors,
+                )
 
         if user_input and user_input.get(FLOW_ENABLED):
             try:
@@ -763,7 +789,7 @@ class VersatileThermostatBaseConfigFlow(FlowHandler):
                 if (
                     not entity_id.startswith("number.")
                     or state is None
-                    or state.attributes.get("unit_of_measurement") != "°C"
+                    or state.attributes.get("unit_of_measurement") != UnitOfTemperature.CELSIUS
                     or device_min is None
                     or device_max is None
                     or device_step is None
@@ -776,7 +802,7 @@ class VersatileThermostatBaseConfigFlow(FlowHandler):
                 sensor = user_input.get(FLOW_SENSOR)
                 if sensor:
                     sensor_state = self.hass.states.get(sensor)
-                    if sensor_state is None or sensor_state.attributes.get("unit_of_measurement") != "°C":
+                    if sensor_state is None or sensor_state.attributes.get("unit_of_measurement") != UnitOfTemperature.CELSIUS:
                         raise ValueError("Invalid Celsius flow sensor")
             except (ValueError, TypeError):
                 return self.async_show_form(

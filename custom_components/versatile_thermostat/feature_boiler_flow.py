@@ -47,6 +47,24 @@ class BoilerFlowManager:
         self._estimated_flow = self.settings.reference
         self._ramp_target = None
         self._reference_since = None
+        self.pulse = None
+        if self.enabled and self.settings.pulse_enabled:
+            from .feature_boiler_pulse import PulseRuntime
+
+            self.pulse = PulseRuntime(self)
+
+    @property
+    def pulse_scheduler(self):
+        return self.pulse.scheduler if self.pulse else None
+
+    def context_for(self, zone):
+        return self.pulse.context_for(zone, self.context) if self.pulse else self.context
+
+    def plan_pulse(self, raw_demand, boiler_on):
+        return self.pulse.plan(raw_demand, boiler_on) if self.pulse else raw_demand
+
+    def pulse_permits_heat(self):
+        return self.pulse is None or self.pulse.permits_heat()
 
     def _zones(self):
         component = self.hass.data.get("climate")
@@ -139,9 +157,12 @@ class BoilerFlowManager:
             desired, reason = choose_flow(self.settings, self._requests())
             if sensor_invalid:
                 desired, reason = self.settings.reference, "flow_sensor_unavailable"
+            pulse = self.pulse.decision if self.pulse else None
+            if pulse is not None:
+                desired, reason = pulse.flow_temperature, pulse.reason
 
             starting = active and not self._was_active
-            if starting or self.target is None:
+            if starting or self.target is None or pulse is not None:
                 # A new heating cycle starts at its current heat requirement.
                 # Calibration and other reference overrides are in desired.
                 candidate = desired
@@ -211,8 +232,10 @@ class BoilerFlowManager:
             elif self._reference_since is None:
                 self._reference_since = now
             settled = self._reference_since is not None and now - self._reference_since >= self.settings.settle_seconds
-            learning = settled and not sensor_invalid
-            if not active:
+            learning = settled and not sensor_invalid and pulse is None
+            if pulse is not None:
+                self._reference_since = None
+            elif not active:
                 reason = "idle"
             self._publish(now, self._estimated_flow, learning, reason)
 
@@ -226,4 +249,5 @@ class BoilerFlowManager:
             "can_heat": self.can_heat,
             "reason": self.reason,
             "context": self.context,
+            **({"pulse": self.pulse.diagnostics} if self.pulse is not None else {}),
         }

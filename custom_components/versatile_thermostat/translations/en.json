@@ -282,13 +282,21 @@
                     "boiler_flow_reference": "Temperature used for SmartPI calibration (°C)",
                     "boiler_flow_target_opening": "Target opening of the most demanding valve (%)",
                     "boiler_flow_exponent": "Radiator temperature exponent",
-                    "boiler_flow_settle_seconds": "Settling time before reference-temperature learning (seconds)"
+                    "boiler_flow_settle_seconds": "Settling time before reference-temperature learning (seconds)",
+                    "boiler_pulse_enabled": "Group low heat demand into full-open radiator pulses",
+                    "boiler_pulse_overshoot": "Allowed rise above the room target (°C)",
+                    "boiler_pulse_undershoot": "Allowed drop below the room target (°C)",
+                    "boiler_pulse_flame_sensor": "Space-heating burner flame (optional binary sensor)",
+                    "boiler_pulse_gas_rate_sensor": "Space-heating gas flow rate (alternative to flame sensor)"
                 },
                 "data_description": {
                     "central_boiler_activation_service": "Command to turn-on the central boiler formatted like entity_id/service_name[/attribut:valeur]",
                     "central_boiler_deactivation_service": "Command to turn-off the central boiler formatted like entity_id/service_name[/attribut:valeur]",
                     "central_boiler_activation_delay_sec": "Delay in seconds before activating the central boiler when it needs to be turned on",
-                    "keep_alive_boiler_delay_sec": "Delay in seconds to periodically resend the boiler command if keep-alive is enabled. Set to 0 to disable keep-alive."
+                    "keep_alive_boiler_delay_sec": "Delay in seconds to periodically resend the boiler command if keep-alive is enabled. Set to 0 to disable keep-alive.",
+                    "boiler_pulse_enabled": "Requires coordinated boiler flow, measured water temperature and matching SmartPI valve controllers.",
+                    "boiler_pulse_flame_sensor": "Select a sensor that is on only while the burner fires for space heating. Leave empty if you have only boiler demand, water temperature, or a combined heating and hot-water flame signal.",
+                    "boiler_pulse_gas_rate_sensor": "Optional. Select a fast gas-flow signal in m³/h or L/min for the space-heating burner alone. It must promptly report zero when off and exclude tap-water draws. Cumulative gas meters and interval averages cannot identify ignition."
                 }
             },
             "valve_regulation": {
@@ -423,7 +431,10 @@
             "min_max_opening_degrees_inconsistent": "For each underlying device, max_opening_degrees must be strictly greater than min_opening_degrees. Please check your configuration.",
             "valve_control_parameters_cardinality_incorrect": "The minimum and maximum opening degree lists cannot contain more values than the configured valves",
             "vswitch_configuration_incorrect": "The command customization configuration is incorrect. It is required for underlying entities that are not switches, and the format must be service_name[/attribute:value]. More information is available in the README",
-            "boiler_flow_invalid": "Use a Celsius number whose range covers the configured temperatures. Minimum must not exceed maximum; maximum must equal the calibration reference. Optional flow sensor must report Celsius."
+            "boiler_flow_invalid": "Use a Celsius number whose range covers the configured temperatures. Minimum must not exceed maximum; maximum must equal the calibration reference. Optional flow sensor must report Celsius.",
+            "pulse_one_burner_sensor": "Select either the space-heating flame sensor or the gas flow rate sensor.",
+            "pulse_gas_unit": "Select an instantaneous gas flow sensor in m³/h or L/min.",
+            "pulse_requires_flow": "Enable coordinated boiler flow and select the actual boiler flow temperature sensor."
         },
         "abort": {
             "already_configured": "Device is already configured"
@@ -699,13 +710,30 @@
                     "central_boiler_activation_service": "Command to turn-on",
                     "central_boiler_deactivation_service": "Command to turn-off",
                     "central_boiler_activation_delay_sec": "Activation delay (seconds)",
-                    "keep_alive_boiler_delay_sec": "Keep-alive delay (seconds)"
+                    "keep_alive_boiler_delay_sec": "Keep-alive delay (seconds)",
+                    "boiler_flow_enabled": "Enable coordinated boiler flow (requires matching SmartPI fork)",
+                    "boiler_flow_entity": "Boiler water flow setpoint (Celsius number entity)",
+                    "boiler_flow_sensor": "Actual boiler flow temperature sensor (optional, Celsius)",
+                    "boiler_flow_min": "Minimum flow temperature (°C)",
+                    "boiler_flow_max": "Maximum flow temperature (must equal reference, °C)",
+                    "boiler_flow_reference": "Temperature used for SmartPI calibration (°C)",
+                    "boiler_flow_target_opening": "Target opening of the most demanding valve (%)",
+                    "boiler_flow_exponent": "Radiator temperature exponent",
+                    "boiler_flow_settle_seconds": "Settling time before reference-temperature learning (seconds)",
+                    "boiler_pulse_enabled": "Group low heat demand into full-open radiator pulses",
+                    "boiler_pulse_overshoot": "Allowed rise above the room target (°C)",
+                    "boiler_pulse_undershoot": "Allowed drop below the room target (°C)",
+                    "boiler_pulse_flame_sensor": "Space-heating burner flame (optional binary sensor)",
+                    "boiler_pulse_gas_rate_sensor": "Space-heating gas flow rate (alternative to flame sensor)"
                 },
                 "data_description": {
                     "central_boiler_activation_service": "Command to turn-on the central boiler formatted like entity_id/service_name[/attribut:valeur]",
                     "central_boiler_deactivation_service": "Command to turn-off the central boiler formatted like entity_id/service_name[/attribut:valeur]",
                     "central_boiler_activation_delay_sec": "Delay in seconds before activating the central boiler when it needs to be turned on",
-                    "keep_alive_boiler_delay_sec": "Delay in seconds to periodically resend the boiler command if keep-alive is enabled. Set to 0 to disable keep-alive."
+                    "keep_alive_boiler_delay_sec": "Delay in seconds to periodically resend the boiler command if keep-alive is enabled. Set to 0 to disable keep-alive.",
+                    "boiler_pulse_enabled": "Requires coordinated boiler flow, measured water temperature and matching SmartPI valve controllers.",
+                    "boiler_pulse_flame_sensor": "Select a sensor that is on only while the burner fires for space heating. Leave empty if you have only boiler demand, water temperature, or a combined heating and hot-water flame signal.",
+                    "boiler_pulse_gas_rate_sensor": "Optional. Select a fast gas-flow signal in m³/h or L/min for the space-heating burner alone. It must promptly report zero when off and exclude tap-water draws. Cumulative gas meters and interval averages cannot identify ignition."
                 }
             },
             "valve_regulation": {
@@ -839,7 +867,11 @@
             "max_opening_degrees_format": "A comma separated list of positive integer between 0 and the max value of the valve is expected. Example: 80, 85, 90",
             "min_max_opening_degrees_inconsistent": "For each underlying device, max_opening_degrees must be strictly greater than min_opening_degrees. Please check your configuration.",
             "valve_control_parameters_cardinality_incorrect": "The minimum and maximum opening degree lists cannot contain more values than the configured valves",
-            "vswitch_configuration_incorrect": "The command customization configuration is incorrect. It is required for underlying entities that are not switches, and the format must be service_name[/attribute:value]. More information is available in the README"
+            "vswitch_configuration_incorrect": "The command customization configuration is incorrect. It is required for underlying entities that are not switches, and the format must be service_name[/attribute:value]. More information is available in the README",
+            "pulse_one_burner_sensor": "Select either the space-heating flame sensor or the gas flow rate sensor.",
+            "pulse_gas_unit": "Select an instantaneous gas flow sensor in m³/h or L/min.",
+            "pulse_requires_flow": "Enable coordinated boiler flow and select the actual boiler flow temperature sensor.",
+            "boiler_flow_invalid": "Use a Celsius number whose range covers the configured temperatures. Minimum must not exceed maximum; maximum must equal the calibration reference. Optional flow sensor must report Celsius."
         },
         "abort": {
             "already_configured": "Device is already configured"

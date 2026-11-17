@@ -70,7 +70,7 @@ class ThermostatProp(BaseThermostat[T], Generic[T]):
 
         api = VersatileThermostatAPI.get_vtherm_api(self.hass)
         manager = api.central_boiler_manager if api else None
-        return manager.boiler_flow.context if manager and manager.boiler_flow.enabled else None
+        return manager.boiler_flow.context_for(self) if manager and manager.boiler_flow.enabled else None
 
     @property
     def on_percent(self) -> float | None:

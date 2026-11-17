@@ -1577,6 +1577,11 @@ class UnderlyingValve(UnderlyingEntity):
 
         return round(max(self._min_open, min(opening_degree, self._max_open)))
 
+    @property
+    def max_opening_degree(self) -> int | None:
+        """Maximum configured opening on the underlying number's scale."""
+        return self._max_opening_degree
+
     def remove_entity(self):
         """Remove the entity"""
         super().remove_entity()

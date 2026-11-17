@@ -63,6 +63,13 @@ async def async_setup_entry(
             # we capture here the configuration for central boiler feature
             api: VersatileThermostatAPI = VersatileThermostatAPI.get_vtherm_api(hass)
             api.central_boiler_manager.post_init(entry.data)
+            flow = api.central_boiler_manager.boiler_flow
+            if flow.settings.pulse_enabled and flow.pulse_scheduler is not None:
+                from .boiler_pulse_store import PulseLearningStore
+
+                flow.pulse_store = PulseLearningStore(hass, unique_id, flow)
+                await flow.pulse_store.async_load()
+                flow.pulse.save_learning = flow.pulse_store.track
             entities = [
                 CentralBoilerBinarySensor(hass, unique_id, name, entry.data),
             ]

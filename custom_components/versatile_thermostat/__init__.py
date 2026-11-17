@@ -213,8 +213,12 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         if api:
             if entry.data.get(CONF_THERMOSTAT_TYPE) == CONF_THERMOSTAT_CENTRAL_CONFIG:
-                api.reset_central_config()
                 api.central_boiler_manager.stop_listening()
+                flow = api.central_boiler_manager.boiler_flow
+                if flow.settings.pulse_enabled and getattr(flow, "pulse_store", None):
+                    flow.pulse.save_learning = None
+                    await flow.pulse_store.async_flush()
+                api.reset_central_config()
             api.remove_entry(entry)
             await api.central_boiler_manager.reload_central_boiler_entities_list()
 

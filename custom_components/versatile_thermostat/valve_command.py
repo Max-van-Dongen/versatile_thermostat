@@ -1,8 +1,11 @@
 """Valve command filter shared by the VTherms driving a valve opening"""
 
 from datetime import datetime
+import time
 
 from vtherm_api.log_collector import get_vtherm_logger
+
+from .boiler_flow import finite
 
 _LOGGER = get_vtherm_logger(__name__)
 
@@ -24,6 +27,38 @@ class ValveCommandMixin:
     _last_calculation_timestamp: datetime | None
     _auto_regulation_dpercent: float | None
     _auto_regulation_period_min: int | None
+    _pulse_command_applied = False
+
+    @property
+    def boiler_pulse_valve_feedback(self) -> float | None:
+        """Least reported opening across this zone, including paired closing degrees.
+
+        Read device entities independently of the thermostat's desired percentage.
+        Some TRVs expose only the reported position setting, not a stroke sensor.
+        """
+        positions = []
+        for under in self.activable_underlying_entities or ():
+            if not under.is_initialized:
+                return None
+            for entity_id, closing in ((under.entity_id, False), (getattr(under, "closing_degree_entity_id", None), True)):
+                if not entity_id:
+                    continue
+                state = self.hass.states.get(entity_id)
+                if state is None or state.attributes.get("assumed_state"):
+                    return None
+                reported = getattr(state, "last_reported", state.last_updated)
+                if not 0 <= time.time() - reported.timestamp() <= 1800:
+                    return None
+                value = finite(state.state)
+                maximum = finite(state.attributes.get("max"))
+                if value is None or maximum is None or maximum <= 0 or not 0 <= value <= maximum:
+                    return None
+                if not closing and under.max_opening_degree is not None and under.max_opening_degree < maximum:
+                    # This device's configured cap cannot select full travel.
+                    return None
+                fraction = value / maximum
+                positions.append(1.0 - fraction if closing else fraction)
+        return min(positions) if positions else None
 
     def apply_valve_command_percent(
         self,
@@ -40,6 +75,16 @@ class ValveCommandMixin:
         if self.is_sleeping:
             return self._retain_valve_open_percent(100, force, filter_dpercent=False)
 
+        # Only bypass filters when the algorithm has actually accepted the
+        # per-zone pulse directive. VTherm safety/clamps keep their authority.
+        algo = getattr(self, "prop_algorithm", None)
+        if getattr(algo, "boiler_pulse_protocol", None) == 1:
+            context = self.boiler_flow_context
+            pulse = context.get("pulse_opening") if context else None
+            if pulse in (0.0, 1.0) and algo.pulse_opening == pulse and on_percent == pulse:
+                self._pulse_command_applied = True
+                return self._retain_valve_open_percent(int(100 * pulse), True, filter_dpercent=False)
+
         if self._auto_regulation_period_min is None or self._auto_regulation_dpercent is None:
             _LOGGER.warning(
                 "%s - auto_regulation_period_min or auto_regulation_dpercent is not set. Keeping current valve command.",
@@ -48,6 +93,13 @@ class ValveCommandMixin:
             return self.valve_open_percent / 100.0
 
         new_valve_percent = round(max(0, min(on_percent, 1)) * 100)
+        if self._pulse_command_applied:
+            # Resume the ordinary output immediately. An old forced opening
+            # must not survive handover just because its regulation period runs.
+            self._pulse_command_applied = False
+            if new_valve_percent < self._auto_regulation_dpercent:
+                new_valve_percent = 0
+            return self._retain_valve_open_percent(new_valve_percent, True, filter_dpercent=False)
         return self._retain_valve_open_percent(new_valve_percent, force)
 
     def _retain_valve_open_percent(

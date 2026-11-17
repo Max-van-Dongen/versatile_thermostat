@@ -88,6 +88,52 @@ prevent the commanded opening from reaching the valve. Flow compensation compose
 with the existing SmartPI curve; it does not correct arbitrary hydraulic or valve
 calibration errors.
 
+## Full-open heating pulses
+
+Install VTherm 10.6.6.post7 and SmartPI 0.6.6.post2 together, then restart Home Assistant.
+In **VTherm central configuration > Central boiler**, enable coordinated flow, select a
+Celsius **Actual boiler flow temperature sensor**, and enable **Group low heat demand
+into full-open radiator pulses**. The option defaults to off for new and existing entries.
+
+| Setting | Effect |
+| --- | --- |
+| Allowed rise above the room target | Default 0.2 C. The controller ends heating in time for residual radiator heat to bring the room towards this upper limit. |
+| Allowed drop below the room target | Default 0.1 C. The controller uses this lower limit to decide when a room will need heat again. |
+| Space-heating burner flame | Optional binary sensor that reports burner activity during space heating. A boiler-demand switch, supply temperature sensor or a flame signal shared with hot-water production cannot distinguish the burner events this feature uses. Leave the field empty if your boiler has no suitable feedback. |
+| Space-heating gas flow rate | Alternative to the flame sensor. Use a near-real-time space-heating gas rate in m³/h or L/min that promptly returns to zero when the burner stops. A cumulative m³ meter, five-minute averages or a whole-house gas rate that includes cooking or hot-water draws cannot identify heating starts. |
+
+For a 20.5 C setpoint the default comfort band is 20.4 to 20.7 C. Room sensors report
+in steps and radiators continue to release heat after shutdown, so individual readings
+may cross the band. Each participating valve opens fully for its pulse. The central
+controller checks the reported opening before starting the boiler. A device that echoes
+a requested position immediately provides weaker evidence of mechanical travel than
+a device reporting actual valve position. Verify this timing on your TRVs when commissioning.
+
+Temperature selection starts at **Minimum flow**. With suitable burner feedback the
+controller can compare pulses for the same combination of rooms and try a warmer
+temperature when repeated burner cutouts prevent a useful run. The configured flow
+maximum bounds those trials. Without burner feedback, pulses can still group room
+demand at minimum flow. The controller cannot measure the number of ignitions from
+water temperature alone. Select at most one burner feedback source. If a template supplies
+the flame or gas-rate signal, make it unavailable during domestic hot-water draws so
+those interruptions cannot train the scheduler. A zero gas rate means a stopped
+space-heating burner. Missing reports leave the burner state unknown.
+Room comfort, other zones needing heat, and the active
+radiators' capacity limit the achievable interval between heating cycles.
+
+SmartPI continues to calculate demand at its calibration reference. Its ordinary
+learning pauses while pulse control owns the valves. Disable the pulse checkbox to
+return to ordinary coordinated flow.
+
+On the central boiler binary sensor, inspect `central_boiler_manager.dynamic_flow.pulse`.
+`phase` progresses from `coast` to `opening` to `heating`. During `opening`,
+compare `requested_valves` with `reported_opening` (0 to 1). During `heating`,
+`requested_flow` is the selected pulse temperature, and `burner` is the separate
+flame observation when available. A `normal` phase and its `reason` explain when a
+room recovery, calibration, incompatible controller or sensor condition gives
+ordinary coordinated flow priority. The scheduler saves completed observations and
+starts each new Home Assistant session from fresh valve and temperature reports.
+
 ## Heat units and learning
 
 For each room, let `q` be SmartPI's heat demand at the reference flow temperature,
