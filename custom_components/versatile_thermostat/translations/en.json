@@ -283,7 +283,7 @@
                     "boiler_flow_target_opening": "Target opening of the most demanding valve (%)",
                     "boiler_flow_exponent": "Radiator temperature exponent",
                     "boiler_flow_settle_seconds": "Settling time before reference-temperature learning (seconds)",
-                    "boiler_pulse_enabled": "Group low heat demand into full-open radiator pulses",
+                    "boiler_pulse_enabled": "Heat rooms with full-open radiator pulses at maximum flow",
                     "boiler_pulse_overshoot": "Allowed rise above the room target (°C)",
                     "boiler_pulse_undershoot": "Allowed drop below the room target (°C)",
                     "boiler_pulse_flame_sensor": "Space-heating burner flame (optional binary sensor)",
@@ -294,7 +294,7 @@
                     "central_boiler_deactivation_service": "Command to turn-off the central boiler formatted like entity_id/service_name[/attribut:valeur]",
                     "central_boiler_activation_delay_sec": "Delay in seconds before activating the central boiler when it needs to be turned on",
                     "keep_alive_boiler_delay_sec": "Delay in seconds to periodically resend the boiler command if keep-alive is enabled. Set to 0 to disable keep-alive.",
-                    "boiler_pulse_enabled": "Requires coordinated boiler flow, measured water temperature and matching SmartPI valve controllers.",
+                    "boiler_pulse_enabled": "Calling valves open fully and share one maximum-temperature run. Each room coasts independently. Requires measured water temperature and matching SmartPI valve controllers.",
                     "boiler_pulse_flame_sensor": "Select a sensor that is on only while the burner fires for space heating. Leave empty if you have only boiler demand, water temperature, or a combined heating and hot-water flame signal.",
                     "boiler_pulse_gas_rate_sensor": "Optional. Select a fast gas-flow signal in m³/h or L/min for the space-heating burner alone. It must promptly report zero when off and exclude tap-water draws. Cumulative gas meters and interval averages cannot identify ignition."
                 }
@@ -720,7 +720,7 @@
                     "boiler_flow_target_opening": "Target opening of the most demanding valve (%)",
                     "boiler_flow_exponent": "Radiator temperature exponent",
                     "boiler_flow_settle_seconds": "Settling time before reference-temperature learning (seconds)",
-                    "boiler_pulse_enabled": "Group low heat demand into full-open radiator pulses",
+                    "boiler_pulse_enabled": "Heat rooms with full-open radiator pulses at maximum flow",
                     "boiler_pulse_overshoot": "Allowed rise above the room target (°C)",
                     "boiler_pulse_undershoot": "Allowed drop below the room target (°C)",
                     "boiler_pulse_flame_sensor": "Space-heating burner flame (optional binary sensor)",
@@ -731,7 +731,7 @@
                     "central_boiler_deactivation_service": "Command to turn-off the central boiler formatted like entity_id/service_name[/attribut:valeur]",
                     "central_boiler_activation_delay_sec": "Delay in seconds before activating the central boiler when it needs to be turned on",
                     "keep_alive_boiler_delay_sec": "Delay in seconds to periodically resend the boiler command if keep-alive is enabled. Set to 0 to disable keep-alive.",
-                    "boiler_pulse_enabled": "Requires coordinated boiler flow, measured water temperature and matching SmartPI valve controllers.",
+                    "boiler_pulse_enabled": "Calling valves open fully and share one maximum-temperature run. Each room coasts independently. Requires measured water temperature and matching SmartPI valve controllers.",
                     "boiler_pulse_flame_sensor": "Select a sensor that is on only while the burner fires for space heating. Leave empty if you have only boiler demand, water temperature, or a combined heating and hot-water flame signal.",
                     "boiler_pulse_gas_rate_sensor": "Optional. Select a fast gas-flow signal in m³/h or L/min for the space-heating burner alone. It must promptly report zero when off and exclude tap-water draws. Cumulative gas meters and interval averages cannot identify ignition."
                 }

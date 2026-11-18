@@ -25,6 +25,7 @@ class PulseRuntime:
         self.feedback = {}
         self.blocking_zone = None
         self.excluded_zones = {}
+        self.native_zones = {}
         self.observed_at = None
         self.water = None
         self.boiler_on = False
@@ -32,15 +33,15 @@ class PulseRuntime:
         self._pending = {}
         self._published = {}
         self._stuck = {}
-        self._recovering = set()
         self._awaiting_handover = False
 
     def _inputs(self, zones, now_wall):
-        """A room needing ordinary control has priority over the shared pulse."""
+        """Separate rooms under native regulation from healthy binary valve controls."""
         inputs = []
         feedback = {}
         outdoor = None
         self.excluded_zones = {}
+        self.native_zones = {}
         for zone in zones:
             self.blocking_zone = zone.entity_id
             if not getattr(zone, "is_ready", False):
@@ -58,7 +59,8 @@ class PulseRuntime:
                 continue
             algo = getattr(zone, "prop_algorithm", None)
             if getattr(algo, "boiler_pulse_protocol", None) != 1:
-                return [], {}, None, "incompatible_zone"
+                self.native_zones[zone.entity_id] = "incompatible_zone"
+                continue
             safety = getattr(zone, "safety_manager", None)
             if getattr(zone, "_safety_state", False) is True or getattr(safety, "is_safety_detected", False) is True:
                 return [], {}, None, "zone_safety"
@@ -84,40 +86,45 @@ class PulseRuntime:
             if demand is None or not 0 <= demand <= 1:
                 return [], {}, None, "invalid_demand"
             if request.get("reference_required"):
-                return [], {}, None, "reference_required"
-            if request.get("pulse_eligible") is not True:
-                if demand > 0 or room < target:
-                    return [], {}, None, "normal_control_required"
+                self.native_zones[zone.entity_id] = "reference_required"
                 continue
-            if demand >= 0.9 or target - room >= max(0.6, self.flow.settings.pulse_undershoot + 0.4):
-                return [], {}, None, "room_recovery"
+            deficit = target - room
+            undershoot = self.flow.settings.pulse_undershoot
+            recovery = (deficit >= max(0.6, undershoot + 0.4)
+                        or (deficit > 0 and request.get("pulse_eligible") is not True
+                            and request.get("recovery_eligible") is True))
+            if (request.get("pulse_eligible") is not True
+                    and not (recovery and request.get("recovery_eligible") is True)):
+                self.native_zones[zone.entity_id] = "normal_control_required"
+                continue
             key = zone.entity_id
             position = finite(getattr(zone, "boiler_pulse_valve_feedback", None))
-            if key in self._recovering:
-                if room < target:
-                    return [], {}, None, "room_recovery"
-                self._recovering.discard(key)
             if key in self._stuck:
                 if position is None or self._stuck[key] == position:
-                    if room < target or demand > 0:
-                        return [], {}, None, "valve_opening_timeout"
+                    self.native_zones[key] = "valve_opening_timeout"
                     continue
                 del self._stuck[key]
             if position is None:
-                if room >= target and demand == 0 and not getattr(zone, "is_device_active", False):
+                reported_closed = getattr(zone, "boiler_pulse_valves_report_closed", False) is True
+                if not reported_closed and room >= target and demand == 0 and not getattr(zone, "is_device_active", False):
                     continue
                 # Prepare a confirmed-closed valve even if the idle reports
                 # are old. Only fresh full-open reports can authorize heat.
-                if ((self.decision is None or self.decision.phase == "coast")
-                        and not getattr(zone, "boiler_pulse_valves_report_closed", False)):
-                    return [], {}, None, "valve_feedback_unavailable"
+                awaiting_report = self.decision is not None and key in self.decision.valves
+                if not reported_closed and (not awaiting_report or getattr(zone, "boiler_pulse_has_reported_load", False) is True):
+                    self.native_zones[key] = "valve_feedback_unavailable"
+                    continue
             feedback[key] = position
             confirmed = zone.valve_open_percent == 100 and position == 1.0
-            inputs.append(PulseZone(key=key, current=room, target=target, demand=demand, open_confirmed=confirmed))
+            window = getattr(zone, "window_manager", None)
+            slope = finite(window.slope_for_measurement(observed)) if window is not None and age <= 300 else None
+            inputs.append(PulseZone(key=key, current=room, target=target, demand=demand, open_confirmed=confirmed,
+                                    recovery=recovery, observed_at=observed.timestamp(), slope_per_hour=slope))
             if outdoor is None:
                 outdoor = finite(getattr(zone, "current_outdoor_temperature", None))
         self.blocking_zone = None
-        return inputs, feedback, outdoor, None if inputs else "no_eligible_rooms"
+        bypass = None if inputs else ("native_control" if self.native_zones else "no_eligible_rooms")
+        return inputs, feedback, outdoor, bypass
 
     @property
     def burner_sensor(self):
@@ -149,8 +156,8 @@ class PulseRuntime:
         self.feedback.clear()
         self.blocking_zone = None
         self.excluded_zones.clear()
+        self.native_zones.clear()
         self._stuck.clear()
-        self._recovering.clear()
         self.scheduler.reset()
         self.decision = None
         self._awaiting_handover = False
@@ -161,7 +168,7 @@ class PulseRuntime:
         # Wake the controller when a delivered-heat input changes. The
         # half-degree step avoids running a room cycle for sensor noise.
         self._published = {
-            key: (opening, self.feedback[key], self.boiler_on, round(self.water * 2))
+            key: (opening, key in self.decision.recovery_zones, self.feedback[key], self.boiler_on, round(self.water * 2))
             for key, opening in openings.items()
         }
         for zone in zones:
@@ -210,16 +217,13 @@ class PulseRuntime:
                 if self._pending:
                     return False
                 self._awaiting_handover = False
-            if self.reason == "valve_opening_timeout":
-                # A stale active-device count must not fire through a valve
-                # still reporting closed. Other active rooms keep their heat.
-                return raw_demand and any(getattr(z, "is_device_active", False) is True for z in zones)
-            return raw_demand
+            return raw_demand and self._native_load_active(zones, all_rooms=True)
 
         self._awaiting_handover = False
+        native_heat_call = raw_demand and self._native_load_active(zones)
         self.decision = self.scheduler.update(
             now=now, zones=inputs, water=self.water, burner=self._burner(),
-            boiler_on=boiler_on is True, outdoor=outdoor,
+            boiler_on=boiler_on is True, outdoor=outdoor, shared_heat_call=native_heat_call,
         )
         if self.scheduler.opening_timeouts:
             for zone in zones:
@@ -229,27 +233,46 @@ class PulseRuntime:
                     if position is None and getattr(zone, "boiler_pulse_valves_report_closed", False):
                         position = 0.0
                     self._stuck[key] = position
-        self._recovering.update(self.scheduler.comfort_timeouts)
         if self.save_learning is not None:
             self.save_learning()
         self.reason = self.decision.reason
         self._set_openings(zones, {zone.key: float(zone.key in self.decision.valves) for zone in inputs})
-        return raw_demand and self.decision.call_for_heat
+        return raw_demand and (self.decision.call_for_heat or self._native_load_active(zones))
+
+    def _native_load_active(self, zones, *, all_rooms=False):
+        """A released room may use the boiler through its ordinary controller."""
+        for zone in zones:
+            key = zone.entity_id
+            if ((not all_rooms and key not in self.native_zones) or key in self.openings or key in self._pending
+                    or not getattr(zone, "is_ready", False) or str(zone.hvac_mode) != "heat"):
+                continue
+            if getattr(zone, "is_device_active", False) is not True:
+                continue
+            command = getattr(zone, "valve_open_percent", None)
+            # Native relays and ordinary climates use their normal activity
+            # signal. Native valve zones also need positive device readback.
+            if command is None:
+                return True
+            if command > 0:
+                reported = getattr(zone, "boiler_pulse_has_reported_load", None)
+                if reported is None:
+                    position = finite(getattr(zone, "boiler_pulse_valve_feedback", None))
+                    reported = position is not None and position > 0
+                if reported is True:
+                    return True
+        return False
 
     def permits_heat(self):
         if self.decision is None:
-            if self.reason == "valve_opening_timeout":
-                return not self._awaiting_handover and any(
-                    getattr(z, "is_device_active", False) is True for z in self.flow._zones()
-                )
-            return not self._awaiting_handover
+            return not self._awaiting_handover and self._native_load_active(self.flow._zones(), all_rooms=True)
+        zones = self.flow._zones()
         if not self.decision.call_for_heat:
-            return False
+            return self._native_load_active(zones)
         return any(
             zone.entity_id in self.decision.valves
             and str(zone.hvac_mode) == "heat" and zone.valve_open_percent == 100
             and zone.boiler_pulse_valve_feedback == 1.0
-            for zone in self.flow._zones()
+            for zone in zones
         )
 
     def context_for(self, zone, context):
@@ -258,6 +281,7 @@ class PulseRuntime:
         return {
             **(context or {}), "version": 1, "observed_at": self.observed_at,
             "pulse_opening": self.openings[zone.entity_id],
+            "pulse_recovery": zone.entity_id in self.decision.recovery_zones,
             "pulse_valve_feedback": self.feedback[zone.entity_id],
             "flow_temperature": self.water, "learning_allowed": False,
             "boiler_active": self.boiler_on,
@@ -272,7 +296,9 @@ class PulseRuntime:
             "reason": self.reason,
             "blocking_zone": self.blocking_zone,
             "excluded_zones": dict(self.excluded_zones),
+            "native_zones": dict(self.native_zones),
             "requested_valves": sorted(self.decision.valves) if self.decision else [],
+            "recovery_zones": sorted(self.decision.recovery_zones) if self.decision else [],
             "reported_opening": self.feedback,
             "requested_flow": self.decision.flow_temperature if self.decision else None,
             "burner": self._burner(), "heat_balance_minutes": self.scheduler.heat_balance_minutes,

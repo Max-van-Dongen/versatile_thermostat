@@ -4,7 +4,8 @@
 import logging
 
 from datetime import timedelta
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -78,6 +79,38 @@ async def _fire_after(hass: HomeAssistant, seconds: int) -> None:
     """Move the time forward and let the timers run"""
     async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=seconds + 1))
     await hass.async_block_till_done()
+
+
+async def test_flow_reacts_to_room_target_and_valve_without_waiting_for_boiler_poll(hass):
+    from custom_components.versatile_thermostat.boiler_flow import FLOW_ENABLED, FLOW_SENSOR, PULSE_ENABLED
+
+    manager = _build_manager(hass)
+    manager.post_init({FLOW_ENABLED: True, FLOW_SENSOR: "sensor.water", PULSE_ENABLED: True,
+                       CONF_CENTRAL_BOILER_ACTIVATION_SRV: ACTIVATE})
+    valve = SimpleNamespace(entity_id="number.kitchen_open", closing_degree_entity_id="number.kitchen_close")
+    kitchen = SimpleNamespace(entity_id="climate.kitchen_zone", is_used_by_central_boiler=True,
+                              activable_underlying_entities=[valve])
+    hass.data[CLIMATE_DOMAIN] = SimpleNamespace(entities=[kitchen])
+    hass.states.async_set(kitchen.entity_id, "heat", {"temperature": 20.5})
+    hass.states.async_set(valve.entity_id, "0")
+    with patch.object(manager, "calculate_central_boiler_state", new_callable=AsyncMock) as plan:
+        await manager.start_listening(force=True)
+        await hass.async_block_till_done()
+        plan.reset_mock()
+        hass.states.async_set(kitchen.entity_id, "heat", {"temperature": 30})
+        await hass.async_block_till_done()
+        assert plan.await_count == 1
+        hass.states.async_set(kitchen.entity_id, "heat", {"temperature": 30, "diagnostic": "updated"})
+        await hass.async_block_till_done()
+        assert plan.await_count == 1
+        hass.states.async_set(valve.entity_id, "100")
+        await hass.async_block_till_done()
+        assert plan.await_count == 2
+
+        manager.stop_listening()
+        hass.states.async_set(kitchen.entity_id, "heat", {"temperature": 17})
+        await hass.async_block_till_done()
+        assert plan.await_count == 2
 
 
 async def test_boiler_entity_missing_defers_deactivate_until_it_appears(hass: HomeAssistant):

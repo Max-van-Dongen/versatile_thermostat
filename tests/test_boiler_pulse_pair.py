@@ -11,7 +11,8 @@ from homeassistant.util import dt as dt_util
 from pytest_homeassistant.common import async_mock_service
 
 from custom_components.versatile_thermostat.boiler_flow import (
-    FLOW_ENABLED, FLOW_ENTITY, FLOW_MAX, FLOW_REFERENCE, FLOW_SENSOR, PULSE_ENABLED,
+    FLOW_ENABLED, FLOW_ENTITY, FLOW_MAX, FLOW_MIN, FLOW_REFERENCE, FLOW_SENSOR, PULSE_ENABLED,
+    PULSE_OVERSHOOT, PULSE_UNDERSHOOT,
 )
 from custom_components.versatile_thermostat.const import (
     CONF_CENTRAL_BOILER_ACTIVATION_DELAY_SEC, CONF_CENTRAL_BOILER_ACTIVATION_SRV,
@@ -64,15 +65,16 @@ class ReportedValveRoom:
 
 
 @pytest.fixture
-def pulse_system(hass):
+def pulse_system(hass, request):
     manager = _build_manager(hass)
     manager.post_init({
-        CONF_CENTRAL_BOILER_ACTIVATION_SRV: "number.flow/number.set_value/value:55",
+        CONF_CENTRAL_BOILER_ACTIVATION_SRV: "number.flow/number.set_value/value:75",
         CONF_CENTRAL_BOILER_DEACTIVATION_SRV: "number.flow/number.set_value/value:0",
         CONF_CENTRAL_BOILER_ACTIVATION_DELAY_SEC: 30,
         CONF_KEEP_ALIVE_BOILER_DELAY_SEC: 60,
         FLOW_ENABLED: True, FLOW_ENTITY: "number.flow", FLOW_SENSOR: "sensor.water",
-        FLOW_MAX: 55, FLOW_REFERENCE: 55, PULSE_ENABLED: True,
+        FLOW_MIN: 50, FLOW_MAX: 75, FLOW_REFERENCE: 75, PULSE_ENABLED: True,
+        **getattr(request, "param", {}),
     })
     manager._total_power_active_threshold_number_entity.native_value = 0
     manager._nb_active_device_threshold_number_entity.native_value = 1
@@ -137,7 +139,7 @@ async def test_satisfied_stale_living_room_leaves_kitchen_free_to_coast_and_puls
         timer.assert_called_once()
         await timer.call_args.args[2](None)
         assert manager.is_on is True
-        assert commands(calls)[-1] == 35
+        assert commands(calls)[-1] == 75
 
         # End at 20.6 so residual radiator heat has room below the 20.7 cap.
         kitchen.current_temperature = 20.6
@@ -198,7 +200,7 @@ async def test_full_open_pulse_obeys_readback_delay_and_coasts(hass, pulse_syste
         assert set(commands(calls)) <= {0}
         await timer.call_args.args[2](None)
         assert manager.is_on is True
-        assert commands(calls)[-1] == 35
+        assert commands(calls)[-1] == 75
 
         # Even before the devices-count sensor updates, reaching the cap
         # withdraws boiler demand and the watchdog must keep the number at zero.
@@ -212,6 +214,274 @@ async def test_full_open_pulse_obeys_readback_delay_and_coasts(hass, pulse_syste
         await manager._keep_alive_boiler(None)
         assert set(commands(calls)) <= {0}
     assert bedroom.prop_algorithm.est.save_state() == model
+
+
+@pytest.mark.parametrize("guard_kick", [False, True])
+@pytest.mark.freeze_time("2026-11-18 10:00:00")
+async def test_large_kitchen_setpoint_change_opens_only_the_cold_room(hass, kitchen_system, guard_kick, freezer):
+    manager, living, kitchen, calls = kitchen_system
+    living.last_temperature_measure = dt_util.utcnow()
+    living.boiler_pulse_valve_feedback = 0.0
+    flow = manager.boiler_flow
+    model = kitchen.prop_algorithm.est.save_state()
+    manager._nb_active_device_number_entity.native_value = 1
+    with patch(MANAGER_MODULE + ".async_call_later", return_value=lambda: None) as timer:
+        await manager.calculate_central_boiler_state(None)
+        await hass.async_block_till_done()
+        assert flow.pulse.diagnostics["phase"] == "coast"
+
+        kitchen.target_temperature = 30.0
+        kitchen.prop_algorithm.guards._guard_kick_active = guard_kick
+        await manager.calculate_central_boiler_state(None)
+        await hass.async_block_till_done()
+        assert kitchen.valve_open_percent == 100
+        assert living.valve_open_percent == 0
+        assert flow.pulse.diagnostics["requested_valves"] == [kitchen.entity_id]
+        await manager._keep_alive_boiler(None)
+        assert not timer.called
+        assert set(commands(calls)) <= {0}
+
+        manager._nb_active_device_number_entity.native_value = 0
+        kitchen.boiler_pulse_valve_feedback = 1.0
+        await manager.calculate_central_boiler_state(None)
+        assert not timer.called
+        manager._nb_active_device_number_entity.native_value = 1
+        await manager.calculate_central_boiler_state(None)
+        timer.assert_called_once()
+        await timer.call_args.args[2](None)
+        assert flow.pulse.diagnostics["phase"] == "recovery"
+        assert manager.is_on
+        assert commands(calls)[-1] == 75
+        assert kitchen.prop_algorithm.boiler_heat_request(1.0)["demand"] == pytest.approx(0.02)
+        assert kitchen.prop_algorithm.est.save_state() == model
+
+        kitchen.prop_algorithm.guards._guard_kick_active = False
+        kitchen.target_temperature = 21.5
+        freezer.tick(timedelta(milliseconds=500))
+        await manager.calculate_central_boiler_state(None)
+        assert manager.is_on
+        assert commands(calls)[-1] == 75
+        timer.assert_called_once()
+
+        kitchen.target_temperature = 20.5
+        await manager.calculate_central_boiler_state(None)
+        await hass.async_block_till_done()
+        assert kitchen.valve_open_percent == 0
+        assert not manager.is_on
+        assert commands(calls)[-1] == 0
+
+
+async def test_each_room_stops_independently_and_restarts_at_floor_with_zero_demand(hass, pulse_system):
+    manager, bedroom, kitchen, calls = pulse_system
+    kitchen.current_temperature = 20.39
+    kitchen.prop_algorithm._set_linear_output(0.02)
+    with patch(MANAGER_MODULE + ".async_call_later", return_value=lambda: None) as timer:
+        await manager.calculate_central_boiler_state(None)
+        await hass.async_block_till_done()
+        assert bedroom.valve_open_percent == kitchen.valve_open_percent == 100
+        assert set(commands(calls)) <= {0}
+        bedroom.boiler_pulse_valve_feedback = 1.0
+        kitchen.boiler_pulse_valve_feedback = 1.0
+        manager._nb_active_device_number_entity.native_value = 2
+        await manager.calculate_central_boiler_state(None)
+        await timer.call_args.args[2](None)
+        assert commands(calls)[-1] == 75
+
+        bedroom.current_temperature = 20.75
+        await manager.calculate_central_boiler_state(None)
+        await hass.async_block_till_done()
+        assert bedroom.valve_open_percent == 0
+        assert kitchen.valve_open_percent == 100
+        assert manager.is_on
+        assert commands(calls)[-1] == 75
+
+        kitchen.current_temperature = 20.75
+        await manager.calculate_central_boiler_state(None)
+        await hass.async_block_till_done()
+        assert bedroom.valve_open_percent == kitchen.valve_open_percent == 0
+        assert not manager.is_on
+        assert commands(calls)[-1] == 0
+
+        manager._nb_active_device_number_entity.native_value = 0
+        bedroom.boiler_pulse_valve_feedback = kitchen.boiler_pulse_valve_feedback = 0.0
+        bedroom.prop_algorithm._set_linear_output(0.0)
+        bedroom.current_temperature = 20.5
+        await manager.calculate_central_boiler_state(None)
+        await hass.async_block_till_done()
+        assert bedroom.valve_open_percent == 0
+        bedroom.current_temperature = 20.4
+        await manager.calculate_central_boiler_state(None)
+        await hass.async_block_till_done()
+        assert bedroom.prop_algorithm.boiler_heat_request(1.0)["demand"] == 0
+        assert bedroom.valve_open_percent == 100
+        assert kitchen.valve_open_percent == 0
+        assert commands(calls)[-1] == 0
+        bedroom.boiler_pulse_valve_feedback = 1.0
+        manager._nb_active_device_number_entity.native_value = 1
+        await manager.calculate_central_boiler_state(None)
+        assert timer.call_count == 2
+        await timer.call_args.args[2](None)
+        assert commands(calls)[-1] == 75
+        assert set(commands(calls)) <= {0, 75}
+
+
+@pytest.mark.parametrize("pulse_system", [{PULSE_ENABLED: False}], indirect=True)
+async def test_disabled_pulses_keep_proportional_room_and_flow_control(hass, pulse_system):
+    manager, _, kitchen, calls = pulse_system
+    kitchen.current_temperature = 20.39
+    kitchen.prop_algorithm._set_linear_output(0.02)
+    manager._nb_active_device_number_entity.native_value = 1
+    with patch(MANAGER_MODULE + ".async_call_later", return_value=lambda: None) as timer:
+        await manager.calculate_central_boiler_state(None)
+        await timer.call_args.args[2](None)
+        await kitchen.async_control_heating()
+    assert "pulse_opening" not in (manager.boiler_flow.context_for(kitchen) or {})
+    assert 0 < kitchen.valve_open_percent < 100
+    assert 50 <= commands(calls)[-1] < 75
+
+
+async def test_capped_room_keeps_ordinary_heat_before_and_after_kitchen_pulse(hass, pulse_system):
+    manager, bedroom, kitchen, calls = pulse_system
+    bedroom.prop_algorithm._max_on_percent = 0.6
+    await bedroom.async_control_heating()
+    bedroom.boiler_pulse_valve_feedback = bedroom.valve_open_percent / 100
+    manager._nb_active_device_number_entity.native_value = 1
+    kitchen.target_temperature = 30.0
+    with patch(MANAGER_MODULE + ".async_call_later", return_value=lambda: None) as timer:
+        await manager.calculate_central_boiler_state(None)
+        await hass.async_block_till_done()
+        await timer.call_args.args[2](None)
+        assert "pulse_opening" not in (manager.boiler_flow.context_for(bedroom) or {})
+        assert 0 < bedroom.valve_open_percent < 100
+        assert kitchen.valve_open_percent == 100
+        assert 50 <= commands(calls)[-1] < 75
+
+        kitchen.boiler_pulse_valve_feedback = 1.0
+        await manager.calculate_central_boiler_state(None)
+        assert commands(calls)[-1] == 75
+        kitchen.target_temperature = 20.5
+        await manager.calculate_central_boiler_state(None)
+        await hass.async_block_till_done()
+        assert kitchen.valve_open_percent == 0
+        assert manager.is_on
+        assert 50 <= commands(calls)[-1] < 75
+        timer.assert_called_once()
+
+
+@pytest.mark.parametrize("pulse_system", [{PULSE_OVERSHOOT: 0.5, PULSE_UNDERSHOOT: 0.5}], indirect=True)
+@pytest.mark.freeze_time("2026-11-18 10:00:00")
+async def test_only_cooling_room_joins_a_native_heat_call(hass, pulse_system, freezer):
+    manager, bedroom, kitchen, calls = pulse_system
+    bedroom.prop_algorithm._max_on_percent = 0.6
+    await bedroom.async_control_heating()
+    bedroom.boiler_pulse_valve_feedback = bedroom.valve_open_percent / 100
+    assert 0 < bedroom.boiler_pulse_valve_feedback < 1
+    manager._nb_active_device_number_entity.native_value = 1
+    kitchen.target_temperature = 20.0
+    kitchen.current_temperature = 19.8
+    kitchen.prop_algorithm._set_linear_output(0.0)
+    with patch(MANAGER_MODULE + ".async_call_later", return_value=lambda: None) as timer:
+        await manager.calculate_central_boiler_state(None)
+        await hass.async_block_till_done()
+        await timer.call_args.args[2](None)
+        assert manager.is_on
+        assert kitchen.valve_open_percent == 0
+        assert 50 <= commands(calls)[-1] < 75
+
+        freezer.tick(timedelta(minutes=5))
+        kitchen.current_temperature = 19.7
+        kitchen.last_temperature_measure = dt_util.utcnow()
+        await manager.calculate_central_boiler_state(None)
+        await hass.async_block_till_done()
+        assert manager.boiler_flow.pulse.diagnostics["requested_valves"] == [kitchen.entity_id]
+        assert kitchen.prop_algorithm.boiler_heat_request(1.0)["demand"] == 0
+        assert kitchen.valve_open_percent == 100
+        assert 50 <= commands(calls)[-1] < 75
+
+        kitchen.boiler_pulse_valve_feedback = 1.0
+        await manager.calculate_central_boiler_state(None)
+        assert commands(calls)[-1] == 75
+        kitchen.current_temperature = 20.4
+        await manager.calculate_central_boiler_state(None)
+        await hass.async_block_till_done()
+        assert kitchen.valve_open_percent == 0
+        assert manager.is_on
+        assert 50 <= commands(calls)[-1] < 75
+        assert "pulse_opening" not in (manager.boiler_flow.context_for(bedroom) or {})
+        timer.assert_called_once()
+
+
+@pytest.mark.parametrize("pulse_system", [{PULSE_OVERSHOOT: 0.5, PULSE_UNDERSHOOT: 0.5}], indirect=True)
+@pytest.mark.parametrize(("kitchen_now", "first_finished"), [
+    (19.7, "bedroom"), (19.7, "kitchen"), (19.8, None), (19.9, None),
+])
+@pytest.mark.freeze_time("2026-11-18 10:00:00")
+async def test_cooling_room_joins_at_first_ignition(hass, pulse_system, freezer, kitchen_now, first_finished):
+    manager, bedroom, kitchen, calls = pulse_system
+    bedroom.target_temperature = kitchen.target_temperature = 20.0
+    bedroom.current_temperature = 20.0
+    kitchen.current_temperature = 19.8
+    kitchen.prop_algorithm._set_linear_output(0.0)
+    with patch(MANAGER_MODULE + ".async_call_later", return_value=lambda: None) as timer:
+        await manager.calculate_central_boiler_state(None)
+        await hass.async_block_till_done()
+        assert bedroom.valve_open_percent == kitchen.valve_open_percent == 0
+
+        # At 0.1 C per five minutes the kitchen is ten minutes from its 19.5 C floor.
+        freezer.tick(timedelta(minutes=5))
+        bedroom.current_temperature = 18.0
+        kitchen.current_temperature = kitchen_now
+        bedroom.last_temperature_measure = kitchen.last_temperature_measure = dt_util.utcnow()
+        await manager.calculate_central_boiler_state(None)
+        await hass.async_block_till_done()
+        assert bedroom.valve_open_percent == 100
+        assert kitchen.prop_algorithm.boiler_heat_request(1.0)["demand"] == 0.0
+        if first_finished is None:
+            assert kitchen.valve_open_percent == 0
+            return
+        assert kitchen.valve_open_percent == 100
+        assert set(commands(calls)) <= {0}
+
+        bedroom.boiler_pulse_valve_feedback = kitchen.boiler_pulse_valve_feedback = 1.0
+        manager._nb_active_device_number_entity.native_value = 2
+        await manager.calculate_central_boiler_state(None)
+        await timer.call_args.args[2](None)
+        assert commands(calls)[-1] == 75
+
+        finish, remaining = (bedroom, kitchen) if first_finished == "bedroom" else (kitchen, bedroom)
+        finish.current_temperature = 20.4
+        await manager.calculate_central_boiler_state(None)
+        await hass.async_block_till_done()
+        assert finish.valve_open_percent == 0
+        assert remaining.valve_open_percent == 100
+        assert manager.is_on
+        assert commands(calls)[-1] == 75
+
+        finish.boiler_pulse_valve_feedback = 0.0
+        remaining.current_temperature = 20.4
+        await manager.calculate_central_boiler_state(None)
+        await hass.async_block_till_done()
+        assert remaining.valve_open_percent == 0
+        assert not manager.is_on
+        assert commands(calls)[-1] == 0
+        timer.assert_called_once()
+
+
+@pytest.mark.parametrize("guard", ["guard_cut", "valve_limit", "safety"])
+async def test_large_setpoint_change_respects_native_controls(hass, kitchen_system, guard):
+    manager, _, kitchen, _ = kitchen_system
+    kitchen.target_temperature = 30.0
+    if guard == "guard_cut":
+        kitchen.prop_algorithm.guards._guard_cut_active = True
+    elif guard == "valve_limit":
+        kitchen.prop_algorithm._max_on_percent = 0.6
+    else:
+        kitchen._safety_state = True
+    await manager.calculate_central_boiler_state(None)
+    await hass.async_block_till_done()
+    await kitchen.async_control_heating()
+    assert "pulse_opening" not in (manager.boiler_flow.context_for(kitchen) or {})
+    assert kitchen.valve_open_percent < 100
 
 
 async def test_lost_valve_before_delayed_start_blocks_burn(hass, pulse_system):

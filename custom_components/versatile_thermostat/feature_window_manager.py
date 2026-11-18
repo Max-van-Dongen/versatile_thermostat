@@ -498,6 +498,10 @@ class FeatureWindowManager(BaseFeatureManager):
             return None
         return self._window_auto_algo.last_slope
 
+    def slope_for_measurement(self, measured_at) -> float | None:
+        """Return the room trend corresponding to a specific temperature report."""
+        return self._window_auto_algo.slope_for_measurement(measured_at) if self._window_auto_algo else None
+
     @property
     def is_detected(self) -> bool:
         """Return the overall state of the feature manager based on window state"""

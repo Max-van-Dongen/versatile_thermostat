@@ -7,9 +7,13 @@ This is a custom implementation, not an upstream VTherm release.
 
 ## What it does
 
-SmartPI still decides each room's required heat. VTherm chooses one shared boiler
-flow temperature that lets the most demanding room approach the configured valve
-opening. All other rooms get independently compensated valve positions.
+With full-open pulses enabled, eligible rooms call for heat at the lower edge of
+their temperature bands. Each calling valve opens fully and VTherm requests the
+configured maximum flow temperature once a valve confirms it is open. As rooms
+approach their upper limits they close independently and coast on radiator heat.
+
+With pulses disabled, SmartPI calculates each room's heat demand and VTherm
+chooses a shared water temperature for proportional valve control.
 
 - Lower demand lowers flow temperature, down to the configured minimum.
 - Higher demand raises it, up to the calibration reference.
@@ -19,9 +23,8 @@ opening. All other rooms get independently compensated valve positions.
   controller can therefore request cooler water while recovering toward target.
 - Active bootstrap/calibration and incompatible active controllers also request
   the reference temperature.
-- Upward changes go directly to the required temperature on the next controller
-  update. Downward changes are limited to 1 C/min, subject to the number entity's
-  step size while heating continues.
+- The controller sends the calculated setpoint directly in either direction
+  within the number entity's allowed range and step size.
 - Each new heating cycle starts directly at its current calculated temperature.
   A low-demand restart after an overshoot does not first heat the water to the
   reference. The same applies to the first activation with an already learned
@@ -90,10 +93,11 @@ calibration errors.
 
 ## Full-open heating pulses
 
-Install VTherm 10.6.6.post8 and SmartPI 0.6.6.post2, then restart Home Assistant.
+Install VTherm 10.6.6.post9 and SmartPI 0.6.6.post3, then restart Home Assistant.
 In **VTherm central configuration > Central boiler**, enable coordinated flow, select a
-Celsius **Actual boiler flow temperature sensor**, and enable **Group low heat demand
-into full-open radiator pulses**. The option defaults to off for new and existing entries.
+Celsius **Actual boiler flow temperature sensor**, and enable **Heat rooms with
+full-open radiator pulses at maximum flow**. An existing enabled pulse setting
+automatically uses this behavior after the update.
 
 | Setting | Effect |
 | --- | --- |
@@ -109,29 +113,42 @@ controller checks the reported opening before starting the boiler. A device that
 a requested position immediately provides weaker evidence of mechanical travel than
 a device reporting actual valve position. Verify this timing on your TRVs when commissioning.
 
-Temperature selection starts at **Minimum flow**. With suitable burner feedback the
-controller can compare pulses for the same combination of rooms and try a warmer
-temperature when repeated burner cutouts prevent a useful run. The configured flow
-maximum bounds those trials. Without burner feedback, pulses can still group room
-demand at minimum flow. The controller cannot measure the number of ignitions from
-water temperature alone. Select at most one burner feedback source. If a template supplies
-the flame or gas-rate signal, make it unavailable during domestic hot-water draws so
-those interruptions cannot train the scheduler. A zero gas rate means a stopped
-space-heating burner. Missing reports leave the burner state unknown.
-Room comfort, other zones needing heat, and the active
-radiators' capacity limit the achievable interval between heating cycles.
+Every coordinated pulse uses **Maximum flow**, including a pulse for a single
+room just below its lower limit. A cooling room still within its band can join
+another room's run early if it has room to absorb heat below its upper limit.
+Each room decides when to close using the temperature
+trend, the rise observed after previous shutoffs and the SmartPI demand at cutoff.
+After the final heat call ends the coordinator sends the configured OFF command.
+
+For example, with a 75 C maximum and a kitchen measuring 20 C, a new effective
+30 C room target calls for a fully open valve and 75 C water. During an active
+run, lowering the kitchen target so that its upper limit is below the measured
+temperature releases that valve. Another room still needing heat can finish the
+same run. Check the kitchen's effective target and active preset when diagnosing
+a manual change. A schedule or preset change can replace the manual target.
+
+With both rooms targeting 20 C and a band of 19.5 to 20.5 C, a room at 18 C
+starts the run. A second room cooling through 19.7 C joins at 100% even while
+its ordinary heat demand is zero. Its cutoff accounts for the heat the radiator
+will still release as the room approaches 20.5 C.
+
+Burner feedback is optional. Select at most one space-heating flame or
+instantaneous gas-rate sensor. If a template supplies the signal, make it
+unavailable during domestic hot-water draws. A valid burner stop near the water
+target lets the coordinator rest the boiler while the radiators release heat.
 
 SmartPI continues to calculate demand at its calibration reference. Its ordinary
 learning pauses while pulse control owns the valves. Disable the pulse checkbox to
 return to ordinary coordinated flow.
 
 On the central boiler binary sensor, inspect `central_boiler_manager.dynamic_flow.pulse`.
-`phase` progresses from `coast` to `opening` to `heating`. During `opening`,
-compare `requested_valves` with `reported_opening` (0 to 1). During `heating`,
-`requested_flow` is the selected pulse temperature, and `burner` is the separate
-flame observation when available. A `normal` phase and its `reason` explain when a
-room recovery, calibration, incompatible controller or sensor condition gives
-ordinary coordinated flow priority. The scheduler saves completed observations and
+`phase` changes from `coast` to `opening` when a room joins. Compare
+`requested_valves` with `reported_opening` (0 to 1) to check valve travel.
+During `heating` or `recovery`, `requested_flow` is the configured maximum.
+`burner` reports the separate flame observation when available. The entries in
+`native_zones` explain why individual rooms are using their ordinary controller,
+for example during calibration or when a valve has an opening limit.
+The scheduler saves room temperature rises observed after shutoff and
 starts each new Home Assistant session from fresh valve and temperature reports.
 
 A room with an old temperature reading can sit out while other rooms pulse.
@@ -148,7 +165,7 @@ from a participating radiator is required before the pulse can start the boiler.
 
 ## Heat units and learning
 
-For each room, let `q` be SmartPI's heat demand at the reference flow temperature,
+For proportional control with full-open pulses disabled, let `q` be each room's heat demand at the reference flow temperature,
 `C(v)` the existing valve curve's inverse (valve position to heat fraction),
 `Tr` room temperature, `Tref` reference flow and `n` the radiator exponent:
 
@@ -159,16 +176,16 @@ valve_command = C_inverse(q / capacity(actual_or_estimated_flow))
 realized_heat = C(applied_valve_position) * capacity(actual_or_estimated_flow)
 ```
 
-VTherm takes the maximum required flow across rooms, clamps it to the configured
-bounds and limits only downward changes. A 100% reference-temperature demand
+VTherm takes the maximum required flow across rooms and applies the device
+step and configured bounds. A 100% reference-temperature demand
 requests the maximum/reference immediately. A valve at 100% because the water
 is cooler instead requests the temperature calculated from its reference heat
 demand and preferred valve opening. If that temperature is 48 C, the setpoint
 goes directly to 48 C rather than ramping up or automatically selecting maximum.
 Calibration and other reference-required conditions still take priority.
-The periodic controller update runs every 60 seconds, with demand events able to
-trigger earlier updates; "immediately" means the next eligible update, not an
-instantaneous change in water temperature. Compensation continues to follow the
+Room target, mode and valve changes trigger new decisions. The controller also
+checks periodically. The physical water temperature follows the new setpoint
+as the boiler and radiators respond. Compensation continues to follow the
 measured or estimated water temperature as the circuit warms.
 
 SmartPI saturates the valve at its allowed

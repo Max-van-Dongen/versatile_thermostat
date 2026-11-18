@@ -52,27 +52,43 @@ class ValveCommandMixin:
     def _boiler_pulse_positions(self, *, require_fresh: bool) -> list[float]:
         positions = []
         for under in self.activable_underlying_entities or ():
-            if not under.is_initialized or not under.entity_id:
+            readings = self._reported_valve_positions(under, require_fresh=require_fresh, require_full_travel=True)
+            if not readings:
                 return []
-            for entity_id, closing in ((under.entity_id, False), (getattr(under, "closing_degree_entity_id", None), True)):
-                if not entity_id:
-                    continue
-                state = self.hass.states.get(entity_id)
-                if state is None or state.attributes.get("assumed_state") or state.attributes.get("restored"):
-                    return []
-                reported = getattr(state, "last_reported", state.last_updated)
-                age = time.time() - reported.timestamp()
-                if age < 0 or (require_fresh and age > 1800):
-                    return []
-                value = finite(state.state)
-                maximum = finite(state.attributes.get("max"))
-                if value is None or maximum is None or maximum <= 0 or not 0 <= value <= maximum:
-                    return []
-                if not closing and under.max_opening_degree is not None and under.max_opening_degree < maximum:
-                    # This device's configured cap cannot select full travel.
-                    return []
-                fraction = value / maximum
-                positions.append(1.0 - fraction if closing else fraction)
+            positions.extend(readings)
+        return positions
+
+    @property
+    def boiler_pulse_has_reported_load(self) -> bool:
+        """A radiator in this zone reports an opening usable by ordinary control."""
+        for under in self.activable_underlying_entities or ():
+            readings = self._reported_valve_positions(under, require_fresh=True, require_full_travel=False)
+            if readings and min(readings) > 0:
+                return True
+        return False
+
+    def _reported_valve_positions(self, under, *, require_fresh, require_full_travel) -> list[float]:
+        if not under.is_initialized or not under.entity_id:
+            return []
+        positions = []
+        for entity_id, closing in ((under.entity_id, False), (getattr(under, "closing_degree_entity_id", None), True)):
+            if not entity_id:
+                continue
+            state = self.hass.states.get(entity_id)
+            if state is None or state.attributes.get("assumed_state") or state.attributes.get("restored"):
+                return []
+            reported = getattr(state, "last_reported", state.last_updated)
+            age = time.time() - reported.timestamp()
+            if age < 0 or (require_fresh and age > 1800):
+                return []
+            value = finite(state.state)
+            maximum = finite(state.attributes.get("max"))
+            if value is None or maximum is None or maximum <= 0 or not 0 <= value <= maximum:
+                return []
+            if require_full_travel and not closing and under.max_opening_degree is not None and under.max_opening_degree < maximum:
+                return []
+            fraction = value / maximum
+            positions.append(1.0 - fraction if closing else fraction)
         return positions
 
     def apply_valve_command_percent(

@@ -16,7 +16,6 @@ from custom_components.versatile_thermostat.boiler_flow import (
     FLOW_OPENING,
     FlowSettings,
     choose_flow,
-    slew_flow,
 )
 from custom_components.versatile_thermostat.feature_boiler_flow import BoilerFlowManager
 
@@ -44,14 +43,8 @@ def test_invalid_demands_fall_back_to_reference(bad):
     assert choose_flow(FlowSettings(), [request(bad)]) == (65, "invalid_demand")
 
 
-def test_calibration_holds_reference_and_only_downward_ramp_is_limited():
+def test_calibration_holds_reference():
     assert choose_flow(FlowSettings(), [request(0.05, reference_required=True)])[0] == 65
-    assert slew_flow(50, 35, 60) == 49
-    assert slew_flow(35, 65, 60) == 65
-    assert slew_flow(35, 65, 3600) == 65
-    assert slew_flow(35, 48, 0) == 48
-    assert slew_flow(50, 35, 3600) == 49
-    assert slew_flow(50, 35, 0) == 50
 
 
 @pytest.mark.parametrize("kwargs", [{"minimum": 70}, {"reference": 50}, {"minimum": float("nan")}, {"opening": 0}, {"exponent": 0}])
@@ -87,7 +80,7 @@ def recovery_zone(demand, room=19.5, target=20.5, *, reference_required=False):
 
 
 @pytest.mark.parametrize("room_target", [19.9, 20.0, 20.5, 23.5])
-async def test_recovery_uses_smartpi_demand_instead_of_room_temperature_deficit(hass, room_target):
+async def test_ordinary_flow_follows_smartpi_demand_in_both_directions(hass, room_target):
     zones = [recovery_zone(0.432, 19.5, room_target), recovery_zone(0.333, 19.6, room_target)]
     manager = build(hass, zones=zones, **{FLOW_MAX: 55, FLOW_REFERENCE: 55, FLOW_OPENING: 90})
     requests = manager._requests()
@@ -97,20 +90,19 @@ async def test_recovery_uses_smartpi_demand_instead_of_room_temperature_deficit(
     assert 39.5 < required < 40.5
     assert reason == "modulating"
     manager.target = 55
-    manager._ramp_target = 55
     manager._was_active = True
     manager._last_tick = 1000
-    with patch("homeassistant.core.ServiceRegistry.async_call", new_callable=AsyncMock):
-        for minute in range(1, 16):
-            with patch("custom_components.versatile_thermostat.feature_boiler_flow.time.monotonic", return_value=1000 + 60 * minute):
-                await manager.refresh(True)
-                assert manager.target == 55 - minute
-                assert manager.reason == "modulating"
-        # A real increase in calculated demand still raises flow immediately.
+    with patch("homeassistant.core.ServiceRegistry.async_call", new_callable=AsyncMock) as calls:
+        with patch("custom_components.versatile_thermostat.feature_boiler_flow.time.monotonic", return_value=1001):
+            await manager.refresh(True)
+            assert manager.target == round(required)
+            assert calls.call_args.args[2] == {"value": round(required)}
+            assert manager.reason == "modulating"
         zones[0] = recovery_zone(1.0, 19.5, room_target)
-        with patch("custom_components.versatile_thermostat.feature_boiler_flow.time.monotonic", return_value=1960):
+        with patch("custom_components.versatile_thermostat.feature_boiler_flow.time.monotonic", return_value=1002):
             await manager.refresh(True)
             assert manager.target == 55
+            assert calls.call_args.args[2] == {"value": 55}
 
 
 @pytest.mark.parametrize("fault", [{"_safety_state": True}, {"current_temperature": None}, {"current_temperature": float("nan")}, {"target_temperature": None}, {"target_temperature": float("nan")}])
@@ -145,7 +137,7 @@ async def test_idle_never_writes_and_keepalive_recovers_external_override(hass):
         manager._requests = lambda: [request()]
         with patch("custom_components.versatile_thermostat.feature_boiler_flow.time.monotonic", return_value=1360):
             await manager.refresh(True)
-            assert call.call_args.args[2] == {"value": 64}
+            assert call.call_args.args[2] == {"value": 35}
         call.reset_mock()
         with patch("custom_components.versatile_thermostat.feature_boiler_flow.time.monotonic", return_value=1420):
             await manager.refresh(True)
@@ -251,17 +243,21 @@ async def test_invalid_sensor_units_keep_reference_fallback(hass, unit):
     assert manager.context["learning_allowed"] is False
 
 
-async def test_frequent_events_accumulate_sub_step_ramp_changes(hass):
+async def test_frequent_events_apply_new_target_once_while_readback_is_delayed(hass):
     manager = build(hass)
     manager.target = 50
-    manager._ramp_target = 50
     manager._was_active = True
     manager._last_tick = 1000
-    with patch("homeassistant.core.ServiceRegistry.async_call", new_callable=AsyncMock):
-        for tick in range(1005, 1061, 5):
+    with patch("homeassistant.core.ServiceRegistry.async_call", new_callable=AsyncMock) as calls:
+        for tick in range(1000, 1005):
             with patch("custom_components.versatile_thermostat.feature_boiler_flow.time.monotonic", return_value=tick):
                 await manager.refresh(True)
-    assert manager.target == 49
+        calls.assert_awaited_once()
+        assert calls.call_args.args[2] == {"value": 35}
+        with patch("custom_components.versatile_thermostat.feature_boiler_flow.time.monotonic", return_value=1005):
+            await manager.refresh(True)
+        assert calls.await_count == 2
+    assert manager.target == 35
 
 
 @pytest.mark.parametrize("demand, expected", [(1.0, 55), (0.7 * (28 / 35) ** 1.3, 48)])
@@ -269,7 +265,6 @@ async def test_rising_demand_sets_required_flow_immediately_using_measured_water
     manager = build(hass, **{FLOW_MAX: 55, FLOW_REFERENCE: 55, FLOW_SENSOR: "sensor.flow"})
     manager._requests = lambda: [request(demand)]
     manager.target = 40
-    manager._ramp_target = 40
     manager._was_active = True
     manager._last_tick = 1000
     hass.states.async_set("sensor.flow", 40, {"unit_of_measurement": "\u00b0C"})

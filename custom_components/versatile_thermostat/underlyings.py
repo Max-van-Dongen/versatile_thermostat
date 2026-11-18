@@ -4,6 +4,7 @@
 import inspect
 import math
 import re
+from collections import deque
 from typing import Any, Dict, List, Optional, Tuple, TypeVar
 from collections.abc import Callable
 from datetime import datetime, timedelta
@@ -710,6 +711,7 @@ class UnderlyingClimate(UnderlyingEntity):
             entity_id=climate_entity_id,
         )
         self._last_sent_temperature: Optional[float] = None
+        self._temperature_command_contexts: deque[tuple[str, float]] = deque(maxlen=32)
         self._last_off_sent_datetime: Optional[datetime] = None
         self._cancel_set_fan_mode_later: Optional[Callable[[], None]] = None
         self._cancel_set_temperature_later: Optional[Callable[[], None]] = None
@@ -1070,10 +1072,15 @@ class UnderlyingClimate(UnderlyingEntity):
 
         try:
             self._last_sent_temperature = target_temp
+            context = None
+            if self._thermostat.follow_underlying_temp_change:
+                context = Context()
+                self._temperature_command_contexts.append((context.id, target_temp))
             await self.hass_services_async_call(
                 CLIMATE_DOMAIN,
                 SERVICE_SET_TEMPERATURE,
                 data,
+                context=context,
             )
         except Exception as ex:
             _LOGGER.error("%s - Error while sending set_temperature: %s", self, ex)
@@ -1082,6 +1089,10 @@ class UnderlyingClimate(UnderlyingEntity):
         _LOGGER.debug("%s - Last_sent_temperature is now: %s", self, self._last_sent_temperature)
 
         return True
+
+    def is_temperature_command_echo(self, state: State, temperature: float) -> bool:
+        """Identify an acknowledgement even after a newer setpoint was sent."""
+        return (state.context.id, temperature) in self._temperature_command_contexts
 
     def sent_off_recently(self) -> bool:
         """True if VTherm sent OFF to this underlying less than off_settle_delay_sec ago"""

@@ -147,6 +147,10 @@ class WindowOpenDetectionAlgorithm:
         """Return the last calculated slope"""
         return self._last_slope
 
+    def slope_for_measurement(self, measured_at: datetime) -> float | None:
+        """Return the slope only when the algorithm accepted this sample."""
+        return self._last_slope if measured_at == self._last_datetime else None
+
     def __str__(self) -> str:
         if self._vtherm and hasattr(self._vtherm, "name"):
             return f"{self._vtherm.name}-WindowOpenDetectionAlgorithm"

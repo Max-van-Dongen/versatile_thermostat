@@ -926,7 +926,14 @@ class ThermostatOverClimate(BaseThermostat[UnderlyingClimate]):
         else:
             await end_climate_changed(changes, preserve_temperature_candidates=True)
         if candidate_temperature is not None:
-            if under.sent_off_recently():
+            if old_state is None or old_state.state in (STATE_UNKNOWN, STATE_UNAVAILABLE):
+                # The first report on startup or reconnection establishes a baseline.
+                self._cancel_underlying_temperature_candidate(under.entity_id)
+                self._underlying_temperature_status[under.entity_id] = "baseline"
+            elif under.is_temperature_command_echo(new_state, candidate_temperature):
+                self._cancel_underlying_temperature_candidate(under.entity_id)
+                self._underlying_temperature_status[under.entity_id] = "echo_possible"
+            elif under.sent_off_recently():
                 # Issue #2185 - the device moved its own setpoint after VTherm turned it OFF: not a user gesture
                 self._cancel_underlying_temperature_candidate(under.entity_id)
                 self._underlying_temperature_status[under.entity_id] = "device_settling"

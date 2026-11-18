@@ -15,7 +15,6 @@ from .boiler_flow import (
     FlowSettings,
     choose_flow,
     finite,
-    slew_flow,
 )
 
 _LOGGER = get_vtherm_logger(__name__)
@@ -45,7 +44,6 @@ class BoilerFlowManager:
         self._last_written_target = None
         self._was_active = False
         self._estimated_flow = self.settings.reference
-        self._ramp_target = None
         self._reference_since = None
         self.pulse = None
         if self.enabled and self.settings.pulse_enabled:
@@ -70,9 +68,23 @@ class BoilerFlowManager:
         component = self.hass.data.get("climate")
         return [zone for zone in list(component.entities) if getattr(zone, "is_used_by_central_boiler", False) is True] if component else []
 
-    def _requests(self):
+    def input_entity_ids(self):
+        """Room inputs and physical reports that can change a live flow decision."""
+        entity_ids = {self.sensor_id} if self.sensor_id else set()
+        for zone in self._zones():
+            entity_ids.add(zone.entity_id)
+            if self.pulse:
+                for valve in getattr(zone, "activable_underlying_entities", ()) or ():
+                    for entity_id in (valve.entity_id, getattr(valve, "closing_degree_entity_id", None)):
+                        if entity_id and entity_id.startswith("number."):
+                            entity_ids.add(entity_id)
+        return entity_ids
+
+    def _requests(self, zone_ids=None):
         requests = []
         for zone in self._zones():
+            if zone_ids is not None and zone.entity_id not in zone_ids:
+                continue
             # OFF, sleeping and cooling zones must not raise the heating flow.
             if str(getattr(zone, "hvac_mode", "off")) != "heat":
                 continue
@@ -99,12 +111,15 @@ class BoilerFlowManager:
         if not self.sensor_id:
             return None
         state = self.hass.states.get(self.sensor_id)
-        if state is None or state.attributes.get("unit_of_measurement") != UnitOfTemperature.CELSIUS:
+        if (state is None or state.attributes.get("unit_of_measurement") != UnitOfTemperature.CELSIUS
+                or state.attributes.get("assumed_state") or state.attributes.get("restored")):
             return None
         reported = getattr(state, "last_reported", state.last_updated)
-        age = now_wall - reported.timestamp()
+        timestamp = reported.timestamp()
         value = finite(state.state)
-        return value if value is not None and 0 <= age <= 600 and 5 <= value <= 100 else None
+        if value is None or not 0 <= now_wall - timestamp <= 600 or not 5 <= value <= 100:
+            return None
+        return value
 
     def _publish(self, now, flow, learning, reason):
         self.reason = reason
@@ -127,9 +142,6 @@ class BoilerFlowManager:
             now = time.monotonic()
             previous_tick = self._last_tick
             elapsed = 0 if previous_tick is None else now - previous_tick
-            # Event storms must not repeatedly consume the ramp allowance.
-            if not force and previous_tick is not None and elapsed < 5 and active == self._was_active:
-                return
             self._last_tick = now
             self.can_heat = False
             state = self.hass.states.get(self.entity_id) if self.entity_id else None
@@ -154,35 +166,41 @@ class BoilerFlowManager:
 
             measured = self._measured_flow(time.time())
             sensor_invalid = bool(self.sensor_id and measured is None)
-            desired, reason = choose_flow(self.settings, self._requests())
+            pulse = self.pulse.decision if self.pulse else None
+            if active and self.pulse and not self.pulse.permits_heat():
+                # Setting the flow number can itself enable the boiler.
+                self._publish(now, measured, False, "waiting_for_valve")
+                return
+            if sensor_invalid and pulse is not None:
+                # The measurement can disappear while waiting for the lock.
+                self._publish(now, None, False, "flow_sensor_unavailable")
+                return
             if sensor_invalid:
                 desired, reason = self.settings.reference, "flow_sensor_unavailable"
-            pulse = self.pulse.decision if self.pulse else None
-            if pulse is not None:
+            elif pulse is not None and (pulse.call_for_heat or not self.pulse.native_zones):
                 desired, reason = pulse.flow_temperature, pulse.reason
+            elif pulse is not None:
+                # A native room can still request heat while the coordinated
+                # radiators are coasting or travelling. Use only its demand.
+                desired, reason = choose_flow(self.settings, self._requests(self.pulse.native_zones))
+            else:
+                desired, reason = choose_flow(self.settings, self._requests())
 
             starting = active and not self._was_active
-            if starting or self.target is None or pulse is not None:
-                # A new heating cycle starts at its current heat requirement.
-                # Calibration and other reference overrides are in desired.
-                candidate = desired
-            elif active:
-                candidate = slew_flow(self._ramp_target if self._ramp_target is not None else self.target, desired, elapsed)
-            else:
-                candidate = self.target
-
-            ramp_candidate = candidate
-
             # Round on the device's grid, constrained to the configured bounds.
             low = ceil((self.settings.minimum - device_min) / step)
             high = floor((self.settings.maximum - device_min) / step)
             if low > high:
                 self._publish(now, None, False, "flow_entity_range_invalid")
                 return
-            candidate = device_min + min(high, max(low, round((candidate - device_min) / step))) * step
+            candidate = device_min + min(high, max(low, round((desired - device_min) / step))) * step
             candidate = round(candidate, 6)
             if active:
-                should_write = force or self._last_sent is None or now - self._last_sent >= 60 or self._last_written_target != candidate or abs(value - candidate) >= step / 2
+                # Apply every new grid value immediately. Allow the number a
+                # few seconds to report an identical command before retrying.
+                since_write = float("inf") if self._last_sent is None else now - self._last_sent
+                should_write = (force or self._last_written_target != candidate or since_write >= 60
+                                or (since_write >= 5 and abs(value - candidate) >= step / 2))
                 if should_write:
                     try:
                         await self.hass.services.async_call(
@@ -199,14 +217,12 @@ class BoilerFlowManager:
                     self._last_sent = now
                     self._last_written_target = candidate
                 self.target = candidate
-                self._ramp_target = ramp_candidate
             else:
                 # In particular, never overwrite a number=0 boiler OFF command.
                 self._last_sent = None
                 # This is only an idle learning baseline, never a command or the
                 # next activation's setpoint. Each new cycle recalculates demand.
                 self.target = self.settings.reference
-                self._ramp_target = self.target
             self.can_heat = True
             if active != self._was_active:
                 # Time spent OFF cannot qualify a new heating period for learning.
@@ -232,10 +248,11 @@ class BoilerFlowManager:
             elif self._reference_since is None:
                 self._reference_since = now
             settled = self._reference_since is not None and now - self._reference_since >= self.settings.settle_seconds
-            learning = settled and not sensor_invalid and pulse is None
-            if pulse is not None:
+            coordinated_only = pulse is not None and not self.pulse.native_zones
+            learning = settled and not sensor_invalid and not coordinated_only
+            if coordinated_only:
                 self._reference_since = None
-            elif not active:
+            elif not active and pulse is None:
                 reason = "idle"
             self._publish(now, self._estimated_flow, learning, reason)
 

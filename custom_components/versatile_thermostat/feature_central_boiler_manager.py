@@ -69,6 +69,7 @@ class FeatureCentralBoilerManager(BaseFeatureManager):
         self._vtherms_starting: bool = False
         self._boiler_flow = BoilerFlowManager(hass, {})
         self._command_lock = asyncio.Lock()
+        self._cancel_flow_inputs = None
 
     @overrides
     def post_init(self, entry_infos: dict):
@@ -116,6 +117,7 @@ class FeatureCentralBoilerManager(BaseFeatureManager):
             self.add_listener(listener_cancel)
 
             if self._boiler_flow.enabled:
+                self._listen_flow_inputs()
                 pulse = self._boiler_flow.pulse
                 self.add_listener(async_track_time_interval(self._hass, self.calculate_central_boiler_state, timedelta(seconds=15 if pulse else 60)))
                 # Flame transitions can be shorter than the polling interval.
@@ -146,6 +148,9 @@ class FeatureCentralBoilerManager(BaseFeatureManager):
     @overrides
     def stop_listening(self) -> bool:
         """Stop all listeners, including the one which waits for the boiler command entity"""
+        if self._cancel_flow_inputs:
+            self._cancel_flow_inputs()
+            self._cancel_flow_inputs = None
         self._stop_waiting_for_boiler_command_entity()
         if self._boiler_flow.pulse:
             self._boiler_flow.pulse.stop()
@@ -514,6 +519,29 @@ class FeatureCentralBoilerManager(BaseFeatureManager):
         """Reload the central boiler list of entities if a central boiler is used"""
         if self._nb_active_device_number_entity is not None:
             await self._nb_active_device_number_entity.listen_vtherms_entities()
+        if self._boiler_flow.enabled and self.is_ready:
+            self._listen_flow_inputs()
+
+    def _listen_flow_inputs(self):
+        """Refresh the flow on room or valve changes even if the active count stays constant."""
+        if self._cancel_flow_inputs:
+            self._cancel_flow_inputs()
+            self._cancel_flow_inputs = None
+        entity_ids = self._boiler_flow.input_entity_ids()
+        if entity_ids:
+            self._cancel_flow_inputs = async_track_state_change_event(
+                self._hass, entity_ids, self._flow_input_changed
+            )
+
+    async def _flow_input_changed(self, event):
+        before = event.data.get("old_state")
+        after = event.data.get("new_state")
+        if before is not None and after is not None and before.state == after.state:
+            # Ignore timestamp and diagnostic churn from the control pass itself.
+            fields = ("temperature", "current_temperature", "hvac_action", "valve_open_percent")
+            if all(before.attributes.get(key) == after.attributes.get(key) for key in fields):
+                return
+        await self.calculate_central_boiler_state(event)
 
     def add_custom_attributes(self, extra_state_attributes: dict[str, Any]) -> None:
         """Add custom attributes to the attributes dict."""

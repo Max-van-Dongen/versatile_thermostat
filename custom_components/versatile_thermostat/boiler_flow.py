@@ -108,11 +108,3 @@ def choose_flow(settings: FlowSettings, requests: list[dict]) -> tuple[float, st
             required = room + (settings.reference - room) * (demand / capacity) ** (1 / settings.exponent)
             desired = max(desired, required)
     return min(settings.maximum, desired), "modulating"
-
-
-def slew_flow(current: float, desired: float, elapsed: float) -> float:
-    """Meet higher demand immediately; fall at 1 C/min without downtime jumps."""
-    if desired >= current:
-        return desired
-    minutes = min(max(elapsed, 0), 60) / 60
-    return max(current - minutes, desired)
