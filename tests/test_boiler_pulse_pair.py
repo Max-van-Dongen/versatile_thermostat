@@ -39,6 +39,7 @@ class ReportedValveRoom:
         self.last_temperature_measure = dt_util.utcnow()
         self.valve_open_percent = 0
         self.boiler_pulse_valve_feedback = 0.0
+        self.reported_positions = None
         algo = self.prop_algorithm = SmartPI(hass, 5, 0, 0, name)
         algo.configure_valve_linearization(False, valve_mode=True)
         algo.est.learn_ok_count_a = 2
@@ -47,7 +48,14 @@ class ReportedValveRoom:
 
     @property
     def is_device_active(self):
-        return bool(self.boiler_pulse_valve_feedback)
+        return getattr(self, "reported_active", bool(self.boiler_pulse_valve_feedback))
+
+    @property
+    def boiler_pulse_valves_report_closed(self):
+        positions = self.reported_positions
+        if positions is None:
+            positions = (self.boiler_pulse_valve_feedback,)
+        return bool(positions) and all(position == 0 for position in positions)
 
     async def async_control_heating(self, force=False):
         context = self.manager.boiler_flow.context_for(self)
@@ -80,6 +88,89 @@ def pulse_system(hass):
 
 def commands(calls):
     return [float(call.data["value"]) for call in calls]
+
+
+@pytest.fixture
+def kitchen_system(pulse_system):
+    manager, living, kitchen, calls = pulse_system
+    living.entity_id = "climate.living_room"
+    living.current_temperature = 21.0
+    living.prop_algorithm._set_linear_output(0.0)
+    living.last_temperature_measure -= timedelta(hours=1)
+    living.boiler_pulse_valve_feedback = None
+    living.reported_positions = (0, 0)
+    kitchen.current_temperature = 20.7
+    kitchen.prop_algorithm._set_linear_output(0.02)
+    return manager, living, kitchen, calls
+
+
+async def test_satisfied_stale_living_room_leaves_kitchen_free_to_coast_and_pulse(hass, kitchen_system):
+    manager, living, kitchen, calls = kitchen_system
+    flow = manager.boiler_flow
+    kitchen.valve_open_percent = 2
+    manager._nb_active_device_number_entity.native_value = 1
+    with patch(MANAGER_MODULE + ".async_call_later", return_value=lambda: None) as timer:
+        await manager.calculate_central_boiler_state(None)
+        await hass.async_block_till_done()
+        assert flow.pulse.diagnostics["excluded_zones"] == {living.entity_id: "room_measurement_stale"}
+        assert flow.pulse.diagnostics["phase"] == "coast"
+        assert "pulse_opening" not in (flow.context_for(living) or {})
+        assert flow.context_for(kitchen)["pulse_opening"] == 0
+        assert kitchen.valve_open_percent == 0
+        assert kitchen.prop_algorithm.boiler_heat_request(1.0)["demand"] == pytest.approx(0.02)
+
+        # Old closed positions permit the kitchen to prepare. They cannot confirm travel.
+        kitchen.current_temperature = 20.4
+        kitchen.boiler_pulse_valve_feedback = None
+        kitchen.reported_positions = (0, 0)
+        await manager.calculate_central_boiler_state(None)
+        await hass.async_block_till_done()
+        assert flow.pulse.diagnostics["phase"] == "opening"
+        assert kitchen.valve_open_percent == 100
+        await manager._keep_alive_boiler(None)
+        assert not timer.called
+        assert set(commands(calls)) <= {0}
+
+        kitchen.boiler_pulse_valve_feedback = 1.0
+        kitchen.reported_positions = (1, 1)
+        await manager.calculate_central_boiler_state(None)
+        timer.assert_called_once()
+        await timer.call_args.args[2](None)
+        assert manager.is_on is True
+        assert commands(calls)[-1] == 35
+
+        # End at 20.6 so residual radiator heat has room below the 20.7 cap.
+        kitchen.current_temperature = 20.6
+        await manager.calculate_central_boiler_state(None)
+        await hass.async_block_till_done()
+        assert flow.pulse.diagnostics["phase"] == "coast"
+        assert not manager.is_on
+        assert kitchen.valve_open_percent == 0
+        assert commands(calls)[-1] == 0
+
+
+@pytest.mark.parametrize("condition", ["demand", "cold", "active", "unknown", "conflicting", "safety"])
+async def test_stale_living_room_requires_all_idle_evidence(hass, kitchen_system, condition):
+    manager, living, kitchen, _ = kitchen_system
+    if condition == "demand":
+        living.prop_algorithm._set_linear_output(0.02)
+    elif condition == "cold":
+        living.current_temperature = living.target_temperature - 0.1
+    elif condition == "active":
+        living.reported_active = True
+    elif condition == "unknown":
+        living.reported_positions = (0, None)
+    elif condition == "conflicting":
+        living.reported_positions = (0, 0.5)
+    else:
+        living._safety_state = True
+    await manager.calculate_central_boiler_state(None)
+    await hass.async_block_till_done()
+    diagnostics = manager.boiler_flow.pulse.diagnostics
+    assert diagnostics["excluded_zones"] == {}
+    assert diagnostics["blocking_zone"] == living.entity_id
+    assert diagnostics["phase"] == "normal"
+    assert "pulse_opening" not in (manager.boiler_flow.context_for(kitchen) or {})
 
 
 async def test_full_open_pulse_obeys_readback_delay_and_coasts(hass, pulse_system):

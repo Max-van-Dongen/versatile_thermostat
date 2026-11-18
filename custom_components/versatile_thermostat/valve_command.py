@@ -36,29 +36,44 @@ class ValveCommandMixin:
         Read device entities independently of the thermostat's desired percentage.
         Some TRVs expose only the reported position setting, not a stroke sensor.
         """
+        positions = self._boiler_pulse_positions(require_fresh=True)
+        return min(positions) if positions else None
+
+    @property
+    def boiler_pulse_valves_report_closed(self) -> bool:
+        """All available degree entities report their fully closed endpoints.
+
+        An unchanged closed number may be old. This check can exclude an idle
+        room or begin valve travel, but cannot confirm an available heat load.
+        """
+        positions = self._boiler_pulse_positions(require_fresh=False)
+        return bool(positions) and max(positions) == 0.0
+
+    def _boiler_pulse_positions(self, *, require_fresh: bool) -> list[float]:
         positions = []
         for under in self.activable_underlying_entities or ():
-            if not under.is_initialized:
-                return None
+            if not under.is_initialized or not under.entity_id:
+                return []
             for entity_id, closing in ((under.entity_id, False), (getattr(under, "closing_degree_entity_id", None), True)):
                 if not entity_id:
                     continue
                 state = self.hass.states.get(entity_id)
-                if state is None or state.attributes.get("assumed_state"):
-                    return None
+                if state is None or state.attributes.get("assumed_state") or state.attributes.get("restored"):
+                    return []
                 reported = getattr(state, "last_reported", state.last_updated)
-                if not 0 <= time.time() - reported.timestamp() <= 1800:
-                    return None
+                age = time.time() - reported.timestamp()
+                if age < 0 or (require_fresh and age > 1800):
+                    return []
                 value = finite(state.state)
                 maximum = finite(state.attributes.get("max"))
                 if value is None or maximum is None or maximum <= 0 or not 0 <= value <= maximum:
-                    return None
+                    return []
                 if not closing and under.max_opening_degree is not None and under.max_opening_degree < maximum:
                     # This device's configured cap cannot select full travel.
-                    return None
+                    return []
                 fraction = value / maximum
                 positions.append(1.0 - fraction if closing else fraction)
-        return min(positions) if positions else None
+        return positions
 
     def apply_valve_command_percent(
         self,

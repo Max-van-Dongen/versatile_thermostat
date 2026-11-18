@@ -14,6 +14,7 @@ from custom_components.versatile_thermostat.feature_boiler_flow import BoilerFlo
 from custom_components.versatile_thermostat.valve_command import ValveCommandMixin
 
 PULSE_MODULE = "custom_components.versatile_thermostat.feature_boiler_pulse"
+VALVE_MODULE = "custom_components.versatile_thermostat.valve_command"
 
 
 @pytest.mark.parametrize(("rate", "unit", "state_class", "age", "assumed", "expected"), [
@@ -62,6 +63,80 @@ async def test_full_open_credit_uses_all_reported_degrees_and_caps(hass):
     first.max_opening_degree = 100
     hass.states.async_set(first.entity_id, 100, {**attrs, "assumed_state": True})
     assert zone.boiler_pulse_valve_feedback is None
+
+
+@pytest.mark.parametrize(("other_opening", "closing", "cap", "extra", "closed"), [
+    (0, 100, 100, {}, True),
+    (10, 100, 100, {}, False),
+    (0, 99, 100, {}, False),
+    (0, 0, 100, {}, False),
+    (0, 100, 90, {}, False),
+    ("unavailable", 100, 100, {}, False),
+    (0, 100, 100, {"assumed_state": True}, False),
+    (0, 100, 100, {"restored": True}, False),
+])
+async def test_idle_evidence_requires_every_reported_endpoint(hass, other_opening, closing, cap, extra, closed):
+    class Zone(ValveCommandMixin):
+        pass
+
+    zone = Zone()
+    zone.hass = hass
+    zone.activable_underlying_entities = [
+        SimpleNamespace(entity_id="number.first", closing_degree_entity_id="number.first_close",
+                        is_initialized=True, max_opening_degree=cap),
+        SimpleNamespace(entity_id="number.second", is_initialized=True, max_opening_degree=None),
+    ]
+    for name, value in [("number.first", 0), ("number.first_close", closing), ("number.second", other_opening)]:
+        hass.states.async_set(name, value, {"min": 0, "max": 100, **extra})
+    with patch(VALVE_MODULE + ".time", wraps=time) as clock:
+        clock.time.return_value = time.time() + 3600
+        assert zone.boiler_pulse_valve_feedback is None
+        assert zone.boiler_pulse_valves_report_closed is closed
+
+
+async def test_old_closed_reports_allow_opening_but_heat_requires_fresh_full_travel(hass):
+    flow = BoilerFlowManager(hass, {FLOW_ENABLED: True, PULSE_ENABLED: True, FLOW_SENSOR: "sensor.supply"})
+    hass.states.async_set("sensor.supply", 34, {"unit_of_measurement": "°C"})
+
+    class Zone(ValveCommandMixin):
+        is_ready = True
+        is_used_by_central_boiler = True
+        is_device_active = False
+        hvac_mode = "heat"
+        entity_id = "climate.test"
+        current_temperature = 19.8
+        target_temperature = 20
+        valve_open_percent = 0
+
+        async def async_control_heating(self, force=False):
+            self.valve_open_percent = round(100 * flow.context_for(self)["pulse_opening"])
+
+    room = Zone()
+    room.hass = hass
+    room.prop_algorithm = SimpleNamespace(boiler_pulse_protocol=1, boiler_heat_request=lambda _: {"demand": 0.05, "pulse_eligible": True})
+    room.last_temperature_measure = datetime.now(timezone.utc)
+    room.activable_underlying_entities = [
+        SimpleNamespace(entity_id="number.trv_open", closing_degree_entity_id="number.trv_close",
+                        is_initialized=True, max_opening_degree=100),
+    ]
+    hass.data["climate"] = SimpleNamespace(entities=[room])
+    degree_range = {"min": 0, "max": 100}
+    hass.states.async_set("number.trv_open", 0, degree_range)
+    hass.states.async_set("number.trv_close", 100, degree_range)
+    with patch(VALVE_MODULE + ".time", wraps=time) as clock:
+        clock.time.return_value = time.time() + 3600
+        assert not flow.plan_pulse(True, False)
+        assert flow.pulse.decision.phase == "opening"
+        await hass.async_block_till_done()
+        assert room.valve_open_percent == 100
+        assert not flow.pulse_permits_heat()
+        hass.states.async_set("number.trv_open", 100, degree_range)
+        hass.states.async_set("number.trv_close", 0, degree_range)
+        assert not flow.plan_pulse(True, False)
+        assert not flow.pulse_permits_heat()
+    assert flow.plan_pulse(True, False)
+    assert flow.pulse_permits_heat()
+    await hass.async_block_till_done()
 
 
 def test_pulse_and_handover_bypass_period_and_change_threshold():

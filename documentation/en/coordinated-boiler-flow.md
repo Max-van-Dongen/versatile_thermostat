@@ -90,7 +90,7 @@ calibration errors.
 
 ## Full-open heating pulses
 
-Install VTherm 10.6.6.post7 and SmartPI 0.6.6.post2 together, then restart Home Assistant.
+Install VTherm 10.6.6.post8 and SmartPI 0.6.6.post2, then restart Home Assistant.
 In **VTherm central configuration > Central boiler**, enable coordinated flow, select a
 Celsius **Actual boiler flow temperature sensor**, and enable **Group low heat demand
 into full-open radiator pulses**. The option defaults to off for new and existing entries.
@@ -133,6 +133,18 @@ flame observation when available. A `normal` phase and its `reason` explain when
 room recovery, calibration, incompatible controller or sensor condition gives
 ordinary coordinated flow priority. The scheduler saves completed observations and
 starts each new Home Assistant session from fresh valve and temperature reports.
+
+A room with an old temperature reading can sit out while other rooms pulse.
+`excluded_zones` identifies rooms last measured at or above target with zero
+heat demand, an inactive thermostat and closed valves. If a stale room could
+still need heat or its valve position conflicts with its command,
+`blocking_zone` identifies the room that returned the system to ordinary control.
+
+For a kitchen target of 17.0 C with the default comfort band, a stable 17.2 C
+kitchen should coast at 0% even if SmartPI still calculates a small heat demand.
+As it cools towards 16.9 C, the coordinator can request 100%. A closed valve
+whose last position report is old may be asked to open. A fresh full-open report
+from a participating radiator is required before the pulse can start the boiler.
 
 ## Heat units and learning
 
