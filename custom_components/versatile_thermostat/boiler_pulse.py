@@ -10,6 +10,7 @@ RETRY_DELAY = 300
 MAX_SAMPLE_GAP = 300
 MAX_TREND_INTERVAL = 1200
 COOLING_RATE = -0.05 / 3600  # degrees per second
+COMPANION_MARGIN = 0.05  # extra degrees of headroom to join an existing run
 MAX_ROOMS = 256
 
 
@@ -74,6 +75,8 @@ class PulseScheduler:
         """Discard physical observations and live commands on reload or a clock gap."""
         self._rooms = {}
         self._members = set()
+        self._admission_reasons = {}
+        self.room_decisions = {}
         self._recovery = set()
         self._heated = set()
         self._finished = set()
@@ -143,13 +146,16 @@ class PulseScheduler:
             return _bounded(zone.slope_per_hour / 3600, -0.003, 0.003)
         return 0.0
 
-    def _at_peak(self, zone, margin=0.0):
+    def _cutoff_temperature(self, zone):
         # Low PI demand and a rising room can anticipate the stop. Keep a
         # positive span above the lower edge even with a large learned rise.
         trend = max(0.0, self._slope(zone)) * 120 * (1 - zone.demand)
         reserve = max(self._residual.get(zone.key, 0.1), trend)
         reserve = min(reserve, self.overshoot + self.undershoot - 0.02)
-        return zone.current + margin >= zone.target + self.overshoot - reserve - 1e-6
+        return zone.target + self.overshoot - reserve
+
+    def _at_peak(self, zone, margin=0.0):
+        return zone.current + margin >= self._cutoff_temperature(zone) - 1e-6
 
     def _due(self, now, zone):
         room = self._rooms[zone.key]
@@ -166,6 +172,7 @@ class PulseScheduler:
             room.cut_temperature = room.peak = zones[key].current
             room.cut_at = now
         self._members.remove(key)
+        self._admission_reasons.pop(key, None)
         self._recovery.discard(key)
         self._heated.discard(key)
         self._opening_since.pop(key, None)
@@ -186,6 +193,27 @@ class PulseScheduler:
             self._saw_flame = False
             self._flame_off_at = None
         return None
+
+    def _room_reason(self, now, zone):
+        """Explain the most recent admission or the current constraint on admission."""
+        key = zone.key
+        if key in self._members:
+            return self._admission_reasons[key]
+        if now < self._rest_until:
+            return "burner_rest"
+        if now < self._rooms[key].retry_after:
+            return "valve_opening_timeout"
+        if self._at_peak(zone):
+            return "cutoff_reached"
+        if key in self._finished:
+            return "finished_this_run"
+        if not self._members and not self._shared_heat_call:
+            return "waiting_for_shared_call"
+        if self._at_peak(zone, margin=COMPANION_MARGIN):
+            return "insufficient_headroom"
+        if not self._rooms[key].has_trend and not _number(zone.slope_per_hour):
+            return "trend_unavailable"
+        return "not_cooling"
 
     def update(self, now, zones, water=None, burner=None, boiler_on=False, outdoor=None, *, shared_heat_call=False):
         """A confirmed independent heat call can also admit eligible cooling companions."""
@@ -229,11 +257,17 @@ class PulseScheduler:
             if due or self._members or shared_heat_call:
                 # One ignition can also serve cooling rooms anywhere inside
                 # their band if there is room for a useful burst plus residual rise.
-                due.update(key for key in candidates - self._finished
-                           if now >= self._rooms[key].retry_after and self._slope(zones[key]) <= COOLING_RATE
-                           and not self._at_peak(zones[key], margin=0.05))
-                for key in due:
+                companions = {key for key in candidates - self._finished - due
+                              if now >= self._rooms[key].retry_after and self._slope(zones[key]) <= COOLING_RATE
+                              and not self._at_peak(zones[key], margin=COMPANION_MARGIN)}
+                for key in due | companions:
                     self._members.add(key)
+                    if key in companions:
+                        self._admission_reasons[key] = "joined_cooling"
+                    elif zones[key].current <= zones[key].target - self.undershoot + 1e-6:
+                        self._admission_reasons[key] = "lower_limit"
+                    else:
+                        self._admission_reasons[key] = "lower_limit_forecast"
                     self._opening_since[key] = now
                     self._rooms[key].cut_temperature = None
         self._recovery.update(key for key in self._members if zones[key].recovery)
@@ -250,7 +284,16 @@ class PulseScheduler:
         # Heat credit is diagnostic only. Integrate this command over the next
         # interval with actual measured supply and acknowledged delivery.
         self._previous = {}
+        self.room_decisions = {}
         for key, zone in zones.items():
+            has_slope = self._rooms[key].has_trend or _number(zone.slope_per_hour)
+            self.room_decisions[key] = {
+                "reason": self._room_reason(now, zone),
+                "slope_per_hour": round(self._slope(zone) * 3600, 4) if has_slope else None,
+                "lower_temperature": round(zone.target - self.undershoot, 3),
+                "upper_temperature": round(zone.target + self.overshoot, 3),
+                "cutoff_temperature": round(self._cutoff_temperature(zone), 3),
+            }
             emitted = 0.0
             if key in confirmed and boiler_on and _number(water):
                 headroom = max(1, self.maximum - zone.current)

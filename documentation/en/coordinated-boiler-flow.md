@@ -222,6 +222,56 @@ at reduced flow. A reference-temperature restart must establish a fresh settling
 period once the measured or estimated water is near reference; idle time does not
 count toward heating-model settling.
 
+## Boiler pulse diagnostics card
+
+VTherm 10.6.6.post10 includes a read-only dashboard card. After updating the
+integration, restart Home Assistant and refresh the dashboard in your browser.
+Choose **Edit dashboard > Add card > Boiler pulse diagnostics**. The card finds
+the central boiler automatically when there is one.
+
+![Example using simulated entities, with the living room heating and the kitchen coasting](images/boiler-pulse-card.png)
+
+For a manual card, use the central boiler entity in your dashboard YAML.
+
+```yaml
+type: custom:vtherm-boiler-pulse-card
+entity: binary_sensor.central_configuration_central_boiler
+```
+
+Rooms are discovered automatically. To select rooms and set their display
+order, add a `rooms` list. A room can use its climate entity alone or specify
+a display name and a SmartPI diagnostics sensor.
+
+```yaml
+type: custom:vtherm-boiler-pulse-card
+entity: binary_sensor.central_configuration_central_boiler
+title: Heating diagnostics
+rooms:
+  - climate.living_room_thermostat
+  - entity: climate.kitchen_thermostat
+    name: Kitchen
+    diagnostics: sensor.kitchen_thermostat_smartpi_diagnostics
+```
+
+The boiler overview and room details show each step of a heat call.
+
+| Reading | How to interpret it |
+| --- | --- |
+| Boiler call and burner | The call is VTherm's request for heating. The burner reading comes from the optional space-heating flame or gas-rate sensor. Without it, actual firing is unknown. |
+| Water setpoint and supply | The setpoint is the commanded water temperature. The supply reading shows how hot the water is at the configured sensor. |
+| Room demand, command and feedback | SmartPI can calculate positive demand while the coordinator commands 0% and lets the room coast. The reported position shows the feedback available from the valve. Missing feedback leaves the position unknown. |
+| Decision and cutoff | Expand a room to see its decision and temperature limits. A cutoff below the upper limit allows for the temperature rise after the valve closes. |
+| SmartPI ETA | A best-case estimate of time to reach the current target under full heating. Check model reliability before using it. The coordinator does not currently schedule a next boiler start from this ETA. |
+
+To use the card with VTherm 10.6.6.post9, download the card file to
+`/config/www/boiler-pulse-card.js`. If you create the `www` directory for the
+first time, restart Home Assistant. In **Settings > Dashboards**, open
+**Resources** from the top-right menu. Add `/local/boiler-pulse-card.js` as a
+**JavaScript module**, then refresh the dashboard. Per-room decision reasons,
+comfort bands and cutoff temperatures first appear in post10. Remove the manual
+resource when upgrading to the bundled card.
+[Card file](../../custom_components/versatile_thermostat/www/boiler-pulse-card.js) · [Home Assistant dashboard resources](https://contributors.home-assistant.io/frontend/custom-ui/resources/)
+
 ## Diagnostics and failure behavior
 
 The central boiler binary sensor exposes `central_boiler_manager.dynamic_flow`:

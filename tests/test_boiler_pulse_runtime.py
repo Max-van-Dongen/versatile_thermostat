@@ -131,6 +131,11 @@ async def test_old_closed_reports_allow_opening_but_heat_requires_fresh_full_tra
         clock.time.return_value = time.time() + 3600
         assert not flow.plan_pulse(True, False)
         assert flow.pulse.decision.phase == "opening"
+        public = flow.diagnostics["pulse"]
+        assert public["overshoot"] == flow.settings.pulse_overshoot
+        assert public["undershoot"] == flow.settings.pulse_undershoot
+        assert public["room_decisions"][room.entity_id]["reason"] == "lower_limit"
+        assert public["requested_valves"] == [room.entity_id]
         await hass.async_block_till_done()
         assert room.valve_open_percent == 100
         assert not flow.pulse_permits_heat()

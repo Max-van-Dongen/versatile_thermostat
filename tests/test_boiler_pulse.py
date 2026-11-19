@@ -43,6 +43,39 @@ def test_forecast_at_zero_pi_admits_a_solo_room_before_the_lower_edge():
     s = PulseScheduler(50, 75, overshoot=0.5, undershoot=0.5)
     assert tick(s, 0, zone(19.8, demand=0)).phase == "coast"
     assert tick(s, 120, zone(19.63, demand=0)).phase == "opening"
+    assert s.room_decisions["bed"]["reason"] == "lower_limit_forecast"
+
+
+def test_room_diagnostics_follow_the_actual_shared_call_and_independent_cutoff():
+    scheduler = PulseScheduler(50, 75, overshoot=0.5, undershoot=0.5)
+    living = zone(18, key="living", opened=True)
+    kitchen = zone(19.7, key="kitchen", demand=0)
+    plan = tick(scheduler, 0, living, kitchen)
+    original = scheduler.room_decisions
+    assert plan.valves == {"living"}
+    assert original["living"]["reason"] == "lower_limit"
+    assert original["kitchen"] == {
+        "reason": "trend_unavailable", "slope_per_hour": None,
+        "lower_temperature": 19.5, "upper_temperature": 20.5, "cutoff_temperature": 20.4,
+    }
+    tick(scheduler, 60, living, kitchen)
+    assert scheduler.room_decisions["kitchen"]["slope_per_hour"] == 0
+    assert scheduler.room_decisions["kitchen"]["reason"] == "not_cooling"
+    assert original["kitchen"]["slope_per_hour"] is None
+    # A genuine cooling sample permits an early start; the reason stays latched as the room warms.
+    joining = tick(scheduler, 360, living, zone(19.65, key="kitchen", demand=0))
+    assert joining.valves == {"living", "kitchen"}
+    assert scheduler.room_decisions["kitchen"]["reason"] == "joined_cooling"
+    assert scheduler.room_decisions["kitchen"]["slope_per_hour"] == -0.6
+    tick(scheduler, 450, living, zone(19.75, key="kitchen", demand=0, opened=True), on=True)
+    assert scheduler.room_decisions["kitchen"]["reason"] == "joined_cooling"
+    assert scheduler.room_decisions["kitchen"]["slope_per_hour"] > 0
+    cutting = tick(scheduler, 470, living, zone(20.45, key="kitchen", opened=True), on=True)
+    assert cutting.valves == {"living"}
+    assert scheduler.room_decisions["kitchen"]["reason"] == "cutoff_reached"
+    assert scheduler.room_decisions["living"]["reason"] == "lower_limit"
+    scheduler.reset()
+    assert scheduler.room_decisions == {}
 
 
 @pytest.mark.parametrize("last,current,joins", [

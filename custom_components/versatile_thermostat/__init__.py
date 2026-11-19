@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Dict
 
 import asyncio
@@ -15,6 +16,8 @@ from homeassistant.const import SERVICE_RELOAD, EVENT_HOMEASSISTANT_STARTED
 from homeassistant.config_entries import ConfigEntry, ConfigType
 from homeassistant.core import HomeAssistant, CoreState, callback
 from homeassistant.helpers.service import async_register_admin_service
+from homeassistant.loader import async_get_integration
+from homeassistant.setup import async_when_setup
 from homeassistant.const import UnitOfTemperature
 
 from vtherm_api.log_collector import VThermLogHandler, async_export_logs, async_register_log_download_endpoint, DEFAULT_MAX_AGE_HOURS
@@ -25,6 +28,8 @@ from .const import *  # pylint: disable=wildcard-import, unused-wildcard-import
 from .vtherm_central_api import VersatileThermostatAPI
 
 _LOGGER = get_vtherm_logger(__name__)
+
+_BOILER_CARD_URL = "/versatile_thermostat/boiler-pulse-card.js"
 
 SELF_REGULATION_PARAM_SCHEMA = {
     vol.Required("kp"): vol.Coerce(float),
@@ -126,7 +131,21 @@ async def async_setup(
         # This provides a /api/versatile_thermostat/logs/<filename> endpoint
         await async_register_log_download_endpoint(hass)
 
+    # Register once per integration setup, independently of thermostat entry reloads.
+    async_when_setup(hass, "frontend", _async_register_boiler_card)
+
     return True
+
+
+async def _async_register_boiler_card(hass: HomeAssistant, _domain: str) -> None:
+    """Serve the packaged card once the optional frontend is available."""
+    from homeassistant.components.frontend import add_extra_js_url
+    from homeassistant.components.http import StaticPathConfig
+
+    integration = await async_get_integration(hass, DOMAIN)
+    path = Path(__file__).with_name("www") / "boiler-pulse-card.js"
+    await hass.http.async_register_static_paths([StaticPathConfig(_BOILER_CARD_URL, str(path))])
+    add_extra_js_url(hass, f"{_BOILER_CARD_URL}?v={integration.version}")
 
 
 async def reload_all_vtherm(hass):
