@@ -256,3 +256,149 @@ def test_loading_damaged_history_cannot_lower_requested_temperature(damaged):
     s = PulseScheduler(50, 75)
     s.restore_learning(damaged)
     assert tick(s, 0, zone(19.5, opened=True)).flow_temperature == 75
+
+
+def start_measured_coast():
+    scheduler = PulseScheduler(50, 75, overshoot=0.5, undershoot=0.3)
+    scheduler.restore_learning({**scheduler.dump_learning(), "residual": {"bed": 0.8}})
+    assert tick(scheduler, 0, zone(19, target=20.5, opened=True, stamp=1000)).call_for_heat
+    tick(scheduler, 30, zone(19.2, target=20.5, opened=True, stamp=1030), on=True)
+    closed = tick(scheduler, 60, zone(20.8, target=20.5, opened=True, stamp=1060), on=True)
+    assert not closed.valves
+    return scheduler
+
+
+def test_delayed_fresh_peak_teaches_rise_above_one_degree_and_survives_restart():
+    scheduler = start_measured_coast()
+    # An unchanged sensor report is returned at every scheduler tick.
+    for now in range(120, 1260, 60):
+        tick(scheduler, now, zone(20.8, target=20.5, stamp=1060))
+    assert scheduler.dump_learning()["residual"]["bed"] == 0.8
+
+    # Like the kitchen, the actual peak arrives over 20 minutes after closure.
+    for now, temp in [(1260, 22.8), (1440, 23.2), (1560, 23.0), (1680, 22.8)]:
+        tick(scheduler, now, zone(temp, target=20.5, stamp=1000 + now))
+    learned = scheduler.dump_learning()
+    assert learned["residual"]["bed"] > 1
+
+    restored = PulseScheduler(50, 75, overshoot=0.5, undershoot=0.3)
+    restored.restore_learning(json.loads(json.dumps(learned)))
+    assert restored.dump_learning()["residual"] == learned["residual"]
+
+
+def test_no_fresh_reading_keeps_estimate_and_later_unrelated_warming_is_ignored():
+    scheduler = start_measured_coast()
+    for now in range(120, 10860, 60):
+        tick(scheduler, now, zone(20.8, target=20.5, stamp=1060))
+    for now, temp in [(10860, 23.5), (10980, 23.2), (11100, 23.0)]:
+        tick(scheduler, now, zone(temp, target=20.5, stamp=1000 + now))
+    assert scheduler.dump_learning()["residual"]["bed"] == 0.8
+
+
+def test_uninterrupted_rise_without_a_peak_is_not_a_measured_coast():
+    scheduler = start_measured_coast()
+    for now in range(120, 4260, 60):
+        temperature = 20.8 + (now - 60) / 3600
+        tick(scheduler, now, zone(temperature, target=20.5, stamp=1000 + now))
+    assert scheduler.dump_learning()["residual"]["bed"] == 0.8
+
+
+def test_target_change_ends_attribution_to_the_previous_pulse():
+    scheduler = start_measured_coast()
+    for now, temp, target in [(120, 21.1, 20.5), (180, 22.0, 17),
+                              (300, 22.7, 17), (420, 22.4, 17), (540, 22.2, 17)]:
+        tick(scheduler, now, zone(temp, target=target, stamp=1000 + now))
+    assert scheduler.dump_learning()["residual"]["bed"] == 0.8
+
+
+def test_learned_rise_can_stop_one_room_below_the_floor_during_shared_recovery():
+    scheduler = PulseScheduler(50, 75, overshoot=0.5, undershoot=0.3)
+    scheduler.restore_learning({**scheduler.dump_learning(), "residual": {"bed": 2.0}})
+    kitchen = zone(18, key="kitchen", target=22, demand=1, opened=True, recovery=True)
+
+    def step(now, current):
+        bed = zone(current, target=20.5, demand=1, opened=True, stamp=1000 + now)
+        return tick(scheduler, now, bed, kitchen, on=now > 0)
+
+    assert step(0, 18.2).valves == {"bed", "kitchen"}
+    assert step(120, 18.4).valves == {"bed", "kitchen"}
+    released = step(300, 19.9)
+    assert released.valves == {"kitchen"} and released.flow_temperature == 75
+    # Still below the 20.2 floor. It should continue coasting while heating up.
+    assert step(315, 19.9).valves == {"kitchen"}
+    assert step(420, 20.1).valves == {"kitchen"}
+
+
+def test_cold_room_above_learned_cutoff_can_start_then_coast_without_reignition():
+    scheduler = PulseScheduler(50, 75, overshoot=0.5, undershoot=0.3)
+    scheduler.restore_learning({**scheduler.dump_learning(), "residual": {"bed": 2.0}})
+    # 19.7 is below the 20.2 floor but above the learned 19.0 cutoff.
+    def step(now, current, *, opened, on):
+        return tick(scheduler, now, zone(current, target=20.5, demand=1,
+                                        opened=opened, stamp=1000 + now), on=on)
+
+    assert step(0, 19.7, opened=False, on=False).phase == "opening"
+    assert step(15, 19.7, opened=True, on=False).call_for_heat
+    assert step(30, 19.7, opened=True, on=True).call_for_heat
+    assert not step(120, 19.9, opened=True, on=True).valves
+    assert not step(135, 19.9, opened=False, on=False).valves
+    assert not step(240, 20.1, opened=False, on=False).valves
+
+
+def test_forecast_does_not_open_a_room_already_at_its_in_band_cutoff():
+    scheduler = PulseScheduler(50, 75, overshoot=0.5, undershoot=0.3)
+    scheduler.restore_learning({**scheduler.dump_learning(), "residual": {"bed": 0.7}})
+    # The floor is 20.2 and the cutoff 20.3. The forecast crosses the floor.
+    above = zone(20.35, target=20.5, demand=1, stamp=1000, slope=-3.6)
+    assert not tick(scheduler, 0, above).valves
+    assert not tick(scheduler, 15, above).valves
+    below = zone(20.25, target=20.5, demand=1, stamp=1060, slope=-3.6)
+    assert tick(scheduler, 60, below).valves == {"bed"}
+
+
+def test_sub_band_release_requires_a_new_room_report_to_reignite_after_timeout():
+    scheduler = PulseScheduler(50, 75, overshoot=0.5, undershoot=0.3)
+    scheduler.restore_learning({**scheduler.dump_learning(), "residual": {"bed": 2.0}})
+    assert tick(scheduler, 0, zone(18.2, target=20.5, opened=True, stamp=1000)).call_for_heat
+    tick(scheduler, 120, zone(18.4, target=20.5, opened=True, stamp=1120), on=True)
+    cut = zone(19.9, target=20.5, opened=True, stamp=1300)
+    assert not tick(scheduler, 300, cut, on=True).valves
+
+    old_report = zone(19.9, target=20.5, stamp=1300)
+    for now in range(360, 4260, 60):
+        assert not tick(scheduler, now, old_report).valves
+    assert scheduler.dump_learning()["residual"]["bed"] == 2.0
+    assert tick(scheduler, 4260, zone(19.8, target=20.5, stamp=5260)).valves == {"bed"}
+
+
+def test_first_late_sensor_report_already_cooling_does_not_teach_a_zero_rise():
+    scheduler = start_measured_coast()
+    for now in range(120, 1260, 60):
+        tick(scheduler, now, zone(20.8, target=20.5, stamp=1060))
+    # The peak between closure and this first fresh reading is unknown.
+    tick(scheduler, 1260, zone(20.3, target=20.5, stamp=2260))
+    assert scheduler.dump_learning()["residual"]["bed"] == 0.8
+
+
+@pytest.mark.parametrize("needs_heat", [False, True])
+def test_burner_rest_observes_coast_until_room_needs_heat_again(needs_heat):
+    scheduler = PulseScheduler(50, 75, overshoot=0.5, undershoot=0.3)
+
+    def step(now, current, opened=False, on=False, burner=None):
+        room = zone(current, target=20.5, demand=1, opened=opened, stamp=1000 + now)
+        return tick(scheduler, now, room, on=on, burner=burner, water=74)
+
+    assert step(0, 19.4, opened=True).call_for_heat
+    step(10, 19.4, opened=True, on=True, burner=True)
+    step(60, 19.6, opened=True, on=True, burner=False)
+    assert step(70, 19.6, opened=True, on=True, burner=False).reason == "burner_reached_flow"
+    assert not step(190, 19.8).valves
+    if needs_heat:
+        assert step(370, 19.9, opened=True).call_for_heat
+        step(430, 19.8, opened=True, on=True)
+        assert scheduler.dump_learning()["residual"] == {}
+    else:
+        assert not step(370, 20.9).valves
+        step(430, 21.2)
+        step(500, 21.0)
+        assert scheduler.dump_learning()["residual"]["bed"] == pytest.approx(0.65 * 0.1 + 0.35 * 1.6)

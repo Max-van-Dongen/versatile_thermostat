@@ -9,6 +9,10 @@ OPEN_TIMEOUT = 180
 RETRY_DELAY = 300
 MAX_SAMPLE_GAP = 300
 MAX_TREND_INTERVAL = 1200
+MAX_COAST_TIME = 3600    # discard an unresolved peak before unrelated heat can be attributed
+MIN_COAST_TIME = 180
+PEAK_DROP = 0.05        # degrees below the highest post-close measurement
+MIN_PULSE_RISE = 0.1    # measurable warming before ending a pulse that starts above its cutoff
 COOLING_RATE = -0.05 / 3600  # degrees per second
 COMPANION_MARGIN = 0.05  # extra degrees of headroom to join an existing run
 MAX_ROOMS = 256
@@ -37,6 +41,17 @@ class PulseDecision:
 
 
 @dataclass
+class CoastObservation:
+    started: float
+    cut_temperature: float
+    peak: float
+    last_temperature: float
+    last_stamp: float | None
+    from_cutoff: bool
+    sampled_early: bool = False
+
+
+@dataclass
 class RoomHistory:
     target: float
     stamp: float
@@ -46,9 +61,13 @@ class RoomHistory:
     has_trend: bool = False
     balance: float = 0.0     # seconds at full reference output
     retry_after: float = 0.0
-    cut_temperature: float | None = None
-    cut_at: float = 0.0
-    peak: float = 0.0
+    coast: CoastObservation | None = None
+    pulse_low: float | None = None
+    pulse_low_stamp: float | None = None
+
+    @property
+    def waiting_for_peak(self):
+        return self.coast is not None and self.coast.from_cutoff
 
 
 def _bounded(value, low, high):
@@ -126,17 +145,45 @@ class PulseScheduler:
             elif now - room.sampled_at > MAX_SAMPLE_GAP:
                 room.slope, room.has_trend = 0.0, False
 
-            if room.cut_temperature is not None:
-                room.peak = max(room.peak, zone.current)
-                if now - room.cut_at >= 900 or (
-                    now - room.cut_at >= 180 and zone.current < room.peak - 0.04
-                ):
-                    rise = _bounded(room.peak - room.cut_temperature, 0, 1)
-                    if key not in self._residual and len(self._residual) >= MAX_ROOMS:
-                        del self._residual[next(iter(self._residual))]
-                    self._residual[key] = 0.65 * self._residual.get(key, 0.1) + 0.35 * rise
-                    room.cut_temperature = None
+            if room.coast is not None:
+                self._observe_coast(now, zone, room)
         self._last = now
+
+    def _observe_coast(self, now, zone, room):
+        coast = room.coast
+        age = now - coast.started
+        stamp = zone.observed_at
+        if _number(stamp) and coast.last_stamp is not None and stamp < coast.last_stamp:
+            room.coast = None
+            return
+        if _number(stamp):
+            if stamp == coast.last_stamp:
+                return
+            coast.last_stamp = stamp
+        elif coast.last_stamp is not None or zone.current == coast.last_temperature:
+            return
+
+        # An expired observation cannot teach a peak. Wait for this first new
+        # report before allowing a cold room to start again on the same reading.
+        if age >= MAX_COAST_TIME:
+            room.coast = None
+            return
+        coast.last_temperature = zone.current
+        coast.peak = max(coast.peak, zone.current)
+        if age <= MIN_COAST_TIME:
+            coast.sampled_early = True
+        if age < MIN_COAST_TIME or coast.peak - zone.current < PEAK_DROP - 1e-6:
+            return
+        room.coast = None
+        rise = coast.peak - coast.cut_temperature
+        # A sensor that first reports cold well after closure may have missed
+        # the whole peak. It can request heat again without teaching a zero rise.
+        if rise == 0 and not coast.sampled_early:
+            return
+        key = zone.key
+        if key not in self._residual and len(self._residual) >= MAX_ROOMS:
+            del self._residual[next(iter(self._residual))]
+        self._residual[key] = 0.65 * self._residual.get(key, 0.1) + 0.35 * rise
 
     def _slope(self, zone):
         room = self._rooms[zone.key]
@@ -147,11 +194,10 @@ class PulseScheduler:
         return 0.0
 
     def _cutoff_temperature(self, zone):
-        # Low PI demand and a rising room can anticipate the stop. Keep a
-        # positive span above the lower edge even with a large learned rise.
+        # Only measured post-close warmth can justify a cutoff below the comfort band.
+        band_reserve = max(0.0, self.overshoot + self.undershoot - 0.02)
         trend = max(0.0, self._slope(zone)) * 120 * (1 - zone.demand)
-        reserve = max(self._residual.get(zone.key, 0.1), trend)
-        reserve = min(reserve, self.overshoot + self.undershoot - 0.02)
+        reserve = max(self._residual.get(zone.key, min(0.1, band_reserve)), min(trend, band_reserve))
         return zone.target + self.overshoot - reserve
 
     def _at_peak(self, zone, margin=0.0):
@@ -159,18 +205,41 @@ class PulseScheduler:
 
     def _due(self, now, zone):
         room = self._rooms[zone.key]
-        if now < room.retry_after or self._at_peak(zone):
+        if now < room.retry_after or room.waiting_for_peak or zone.current >= zone.target + self.overshoot:
             return False
         lower = zone.target - self.undershoot
+        cutoff = self._cutoff_temperature(zone)
+        if cutoff > lower and zone.current >= cutoff - 1e-6:
+            return False
         # Forecast three minutes for valve travel, boiler ignition and transit.
         forecast = zone.current + min(0.0, self._slope(zone)) * 180
         return zone.current <= zone.target and forecast <= lower + 1e-6
 
-    def _release(self, key, now, zones):
-        if key in zones and key in self._heated:
-            room = self._rooms[key]
-            room.cut_temperature = room.peak = zones[key].current
-            room.cut_at = now
+    def _should_close(self, zone):
+        room = self._rooms[zone.key]
+        if room.pulse_low is None or zone.current <= room.pulse_low:
+            room.pulse_low = zone.current
+            room.pulse_low_stamp = zone.observed_at
+        if zone.current >= zone.target + self.overshoot:
+            return True
+        cutoff = self._cutoff_temperature(zone)
+        if zone.current < cutoff - 1e-6:
+            return False
+        if cutoff > zone.target - self.undershoot:
+            return True
+        # A cold radiator can start above a learned cutoff. Give this pulse a
+        # chance to deliver heat before expecting it to coast to the upper edge.
+        fresh = room.pulse_low_stamp is None or (
+            _number(zone.observed_at) and zone.observed_at > room.pulse_low_stamp
+        )
+        return (zone.key in self._heated and fresh
+                and zone.current - room.pulse_low >= MIN_PULSE_RISE - 1e-6)
+
+    def _release(self, key, now, zone=None, *, at_cutoff=False):
+        if zone is not None and key in self._heated:
+            self._rooms[key].coast = CoastObservation(
+                now, zone.current, zone.current, zone.current, zone.observed_at, from_cutoff=at_cutoff
+            )
         self._members.remove(key)
         self._admission_reasons.pop(key, None)
         self._recovery.discard(key)
@@ -203,7 +272,7 @@ class PulseScheduler:
             return "burner_rest"
         if now < self._rooms[key].retry_after:
             return "valve_opening_timeout"
-        if self._at_peak(zone):
+        if self._rooms[key].waiting_for_peak or self._at_peak(zone):
             return "cutoff_reached"
         if key in self._finished:
             return "finished_this_run"
@@ -225,17 +294,23 @@ class PulseScheduler:
             self._finished.clear()
         self._shared_heat_call = shared_heat_call
         for key in self._members.copy():
-            if key not in zones or self._at_peak(zones[key]):
+            if key not in zones:
                 self._finished.add(key)
-                self._release(key, now, zones)
-            elif zones[key].open_confirmed:
+                self._release(key, now)
+                continue
+            zone = zones[key]
+            room = self._rooms[key]
+            if zone.open_confirmed:
                 self._opening_since[key] = now
-                if self._calling and boiler_on:
+                if self._calling and boiler_on and room.pulse_low is not None:
                     self._heated.add(key)
+            if self._should_close(zone):
+                self._finished.add(key)
+                self._release(key, now, zone, at_cutoff=True)
             elif now - self._opening_since[key] >= OPEN_TIMEOUT:
                 self.opening_timeouts.add(key)
                 self._rooms[key].retry_after = now + RETRY_DELAY
-                self._release(key, now, zones)
+                self._release(key, now)
 
         confirmed = {key for key in self._members if zones[key].open_confirmed}
         stop = None
@@ -247,7 +322,7 @@ class PulseScheduler:
         if stop:
             self._rest_until = now + RETRY_DELAY
             for key in self._members.copy():
-                self._release(key, now, zones)
+                self._release(key, now, zones[key])
 
         if now >= self._rest_until:
             candidates = zones.keys() - self._members
@@ -258,7 +333,8 @@ class PulseScheduler:
                 # One ignition can also serve cooling rooms anywhere inside
                 # their band if there is room for a useful burst plus residual rise.
                 companions = {key for key in candidates - self._finished - due
-                              if now >= self._rooms[key].retry_after and self._slope(zones[key]) <= COOLING_RATE
+                              if now >= self._rooms[key].retry_after and not self._rooms[key].waiting_for_peak
+                              and self._slope(zones[key]) <= COOLING_RATE
                               and not self._at_peak(zones[key], margin=COMPANION_MARGIN)}
                 for key in due | companions:
                     self._members.add(key)
@@ -269,7 +345,9 @@ class PulseScheduler:
                     else:
                         self._admission_reasons[key] = "lower_limit_forecast"
                     self._opening_since[key] = now
-                    self._rooms[key].cut_temperature = None
+                    self._rooms[key].coast = None
+                    self._rooms[key].pulse_low = zones[key].current
+                    self._rooms[key].pulse_low_stamp = zones[key].observed_at
         self._recovery.update(key for key in self._members if zones[key].recovery)
         confirmed = {key for key in self._members if zones[key].open_confirmed}
         self._calling = bool(confirmed)
@@ -319,4 +397,4 @@ class PulseScheduler:
             # Version one also included water-temperature trials. They have no
             # meaning for binary calls and are deliberately ignored.
             self._residual = {key: value for key, value in list(residual.items())[-MAX_ROOMS:]
-                              if isinstance(key, str) and _number(value) and 0 <= value <= 1}
+                              if isinstance(key, str) and _number(value) and value >= 0}

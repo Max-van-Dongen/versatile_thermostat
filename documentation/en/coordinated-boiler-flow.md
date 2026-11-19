@@ -148,8 +148,18 @@ During `heating` or `recovery`, `requested_flow` is the configured maximum.
 `burner` reports the separate flame observation when available. The entries in
 `native_zones` explain why individual rooms are using their ordinary controller,
 for example during calibration or when a valve has an opening limit.
-The scheduler saves room temperature rises observed after shutoff and
-starts each new Home Assistant session from fresh valve and temperature reports.
+After a heating pulse, the scheduler watches fresh room temperatures for up to
+one hour. A fall of at least 0.05 C from the peak, at least three minutes after
+closure, completes the observation. If the sensor stops reporting, the target
+changes, or the hour ends without a measured downturn, the room keeps its
+previous estimate. Completed estimates survive a Home Assistant restart.
+
+The pulse cutoff is the upper comfort limit minus the expected temperature
+rise after closure. For example, a room with a 21 C upper limit and a learned
+2 C rise can close its valve at 19 C. When a cold room starts above its own
+cutoff, the controller waits for confirmed heat and at least 0.1 C of warming
+from that pulse's lowest reading before using the below-band cutoff. Each room
+can then coast while another radiator continues to heat.
 
 Pulse control accepts the thermostat's last room temperature report for 24 hours,
 including a report exactly 24 hours old. After that, the card marks the report
