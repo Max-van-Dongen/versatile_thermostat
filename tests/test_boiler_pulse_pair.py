@@ -98,7 +98,7 @@ def kitchen_system(pulse_system):
     living.entity_id = "climate.living_room"
     living.current_temperature = 21.0
     living.prop_algorithm._set_linear_output(0.0)
-    living.last_temperature_measure -= timedelta(hours=1)
+    living.last_temperature_measure -= timedelta(days=1, seconds=1)
     living.boiler_pulse_valve_feedback = None
     living.reported_positions = (0, 0)
     kitchen.current_temperature = 20.7
@@ -172,7 +172,67 @@ async def test_stale_living_room_requires_all_idle_evidence(hass, kitchen_system
     assert diagnostics["excluded_zones"] == {}
     assert diagnostics["blocking_zone"] == living.entity_id
     assert diagnostics["phase"] == "normal"
+    assert diagnostics["reason"] == ("zone_safety" if condition == "safety" else "room_measurement_stale")
     assert "pulse_opening" not in (manager.boiler_flow.context_for(kitchen) or {})
+
+
+@pytest.mark.parametrize("age", [timedelta(hours=1), timedelta(days=1, seconds=-1), timedelta(days=1)])
+@pytest.mark.freeze_time("2026-11-19 15:45:00")
+async def test_kitchen_report_through_24_hours_can_request_a_pulse(hass, kitchen_system, freezer, age):
+    manager, _, kitchen, calls = kitchen_system
+    kitchen.current_temperature = 18.9
+    kitchen.safety_manager = SimpleNamespace(safety_delay_min=60, is_safety_detected=False)
+    kitchen.last_temperature_measure = dt_util.utcnow() - age
+
+    await manager.calculate_central_boiler_state(None)
+    await hass.async_block_till_done()
+    diagnostics = manager.boiler_flow.pulse.diagnostics
+    assert diagnostics["room_temperature_timeout_sec"] == 86400
+    assert diagnostics["blocking_zone"] is None
+    assert diagnostics["requested_valves"] == [kitchen.entity_id]
+    assert kitchen.valve_open_percent == 100
+    assert not manager.is_on
+    assert set(commands(calls)) <= {0}
+
+
+@pytest.mark.freeze_time("2026-11-19 15:45:00")
+async def test_cold_kitchen_resumes_on_fresh_report_after_timeout(hass, kitchen_system, freezer):
+    manager, _, kitchen, _ = kitchen_system
+    kitchen.current_temperature = 18.9
+    kitchen.last_temperature_measure = dt_util.utcnow() - timedelta(days=1, seconds=1)
+
+    await manager.calculate_central_boiler_state(None)
+    await hass.async_block_till_done()
+    flow = manager.boiler_flow
+    assert flow.pulse.diagnostics["blocking_zone"] == kitchen.entity_id
+    assert flow.pulse.diagnostics["reason"] == "room_measurement_stale"
+    assert "pulse_opening" not in (flow.context_for(kitchen) or {})
+
+    kitchen.last_temperature_measure = dt_util.utcnow()
+    await manager.calculate_central_boiler_state(None)
+    await hass.async_block_till_done()
+    assert flow.pulse.diagnostics["blocking_zone"] is None
+    assert flow.pulse.diagnostics["requested_valves"] == [kitchen.entity_id]
+    assert kitchen.valve_open_percent == 100
+
+
+@pytest.mark.parametrize("report", ["future", "missing_time", "missing_room", "missing_target"])
+@pytest.mark.freeze_time("2026-11-19 15:45:00")
+async def test_invalid_kitchen_measurement_is_unavailable_immediately(hass, kitchen_system, freezer, report):
+    manager, _, kitchen, _ = kitchen_system
+    if report == "future":
+        kitchen.last_temperature_measure = dt_util.utcnow() + timedelta(seconds=1)
+    elif report == "missing_time":
+        kitchen.last_temperature_measure = None
+    elif report == "missing_room":
+        kitchen.current_temperature = None
+    else:
+        kitchen.target_temperature = None
+    await manager.calculate_central_boiler_state(None)
+    await hass.async_block_till_done()
+    diagnostics = manager.boiler_flow.pulse.diagnostics
+    assert diagnostics["reason"] == "room_measurement_unavailable"
+    assert diagnostics["blocking_zone"] == kitchen.entity_id
 
 
 async def test_full_open_pulse_obeys_readback_delay_and_coasts(hass, pulse_system):
@@ -507,7 +567,7 @@ async def test_ineligible_room_or_sensor_releases_forced_opening(hass, pulse_sys
     await hass.async_block_till_done()
     assert bedroom.valve_open_percent == 100
     if cause == "room_stale":
-        bedroom.last_temperature_measure -= timedelta(hours=1)
+        bedroom.last_temperature_measure -= timedelta(days=1, seconds=1)
     elif cause == "old_plugin":
         bedroom.prop_algorithm.boiler_pulse_protocol = 0
     else:

@@ -353,7 +353,13 @@ class BoilerPulseCard extends HTMLElement {
       node("span", "", "Request " + unit(request ?? a.valve_open_percent, "%"))));
     const why = pulse.native_zones?.[id] || pulse.excluded_zones?.[id] ||
       (pulse.blocking_zone === id ? pulse.reason : null) || decision.reason;
-    if (why) header.append(node("p", "decision", readable(why)));
+    if (why) {
+      const limit = number(pulse.room_temperature_timeout_sec);
+      const reason = why === "room_measurement_stale" && limit !== null
+        ? "Room temperature report is older than " + unit(limit / 3600, " h")
+        : readable(why);
+      header.append(node("p", "decision", reason));
+    }
     const details = section(id, header);
     const body = details.lastElementChild;
     const c = v => storeUnit === "°F" && v !== null ? (v - 32) * 5 / 9 : v;

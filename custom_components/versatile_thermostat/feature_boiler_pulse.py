@@ -8,6 +8,8 @@ from homeassistant.const import UnitOfTemperature
 from .boiler_flow import PULSE_GAS_RATE_UNITS, finite
 from .boiler_pulse import PulseScheduler, PulseZone
 
+ROOM_TEMPERATURE_TIMEOUT_SEC = 24 * 60 * 60
+
 
 class PulseRuntime:
     """Coordinate eligible zones through their ordinary SmartPI valve controls."""
@@ -66,23 +68,23 @@ class PulseRuntime:
                 return [], {}, None, "zone_safety"
             room, target = finite(zone.current_temperature), finite(zone.target_temperature)
             observed = zone.last_temperature_measure
-            delay = finite(getattr(safety, "safety_delay_min", None))
-            age_limit = min(1800, delay * 60) if delay and delay > 0 else 1800
             if room is None or target is None or not isinstance(observed, datetime):
                 return [], {}, None, "room_measurement_unavailable"
             age = now_wall - observed.timestamp()
+            if age < 0:
+                return [], {}, None, "room_measurement_unavailable"
             request = algo.boiler_heat_request(self.flow.settings.opening)
             demand = finite(request.get("demand"))
-            if not 0 <= age <= age_limit:
+            if age > ROOM_TEMPERATURE_TIMEOUT_SEC:
                 # Leave a satisfied, closed room under its own thermostat's
                 # control. No pulse decision or heat credit uses its old sample.
-                if (age > age_limit and room >= target and demand == 0
+                if (room >= target and demand == 0
                         and not request.get("reference_required")
                         and zone.valve_open_percent == 0 and zone.is_device_active is False
                         and getattr(zone, "boiler_pulse_valves_report_closed", False) is True):
                     self.excluded_zones[zone.entity_id] = "room_measurement_stale"
                     continue
-                return [], {}, None, "room_measurement_unavailable"
+                return [], {}, None, "room_measurement_stale"
             if demand is None or not 0 <= demand <= 1:
                 return [], {}, None, "invalid_demand"
             if request.get("reference_required"):
@@ -295,6 +297,7 @@ class PulseRuntime:
             "phase": self.decision.phase if self.decision else "normal",
             "reason": self.reason,
             "blocking_zone": self.blocking_zone,
+            "room_temperature_timeout_sec": ROOM_TEMPERATURE_TIMEOUT_SEC,
             "overshoot": self.scheduler.overshoot,
             "undershoot": self.scheduler.undershoot,
             "room_decisions": self.scheduler.room_decisions,

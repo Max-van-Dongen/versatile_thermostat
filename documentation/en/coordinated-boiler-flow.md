@@ -151,7 +151,11 @@ for example during calibration or when a valve has an opening limit.
 The scheduler saves room temperature rises observed after shutoff and
 starts each new Home Assistant session from fresh valve and temperature reports.
 
-A room with an old temperature reading can sit out while other rooms pulse.
+Pulse control accepts the thermostat's last room temperature report for 24 hours,
+including a report exactly 24 hours old. After that, the card marks the report
+as stale until the thermostat receives a fresh one. A room already in
+thermostat safety mode follows its safety settings. A room with an expired
+temperature reading can sit out while other rooms pulse.
 `excluded_zones` identifies rooms last measured at or above target with zero
 heat demand, an inactive thermostat and closed valves. If a stale room could
 still need heat or its valve position conflicts with its command,
