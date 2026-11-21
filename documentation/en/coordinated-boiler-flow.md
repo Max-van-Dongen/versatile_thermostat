@@ -161,6 +161,14 @@ cutoff, the controller waits for confirmed heat and at least 0.1 C of warming
 from that pulse's lowest reading before using the below-band cutoff. Each room
 can then coast while another radiator continues to heat.
 
+When a room's predicted cutoff is within 0.1 C of its lower comfort limit or
+below it, a single sensor step can cross both the opening and closing thresholds.
+In this case the room must stay at or below its lower limit for two minutes to
+open, including when joining another room's run. A reading at least 0.1 C below
+the lower limit qualifies immediately. After a temperature cutoff, that room
+waits at least three minutes before reopening at the same target, even if the
+boiler had not yet activated. Closing at the cutoff remains immediate.
+
 Pulse control accepts the thermostat's last room temperature report for 24 hours,
 including a report exactly 24 hours old. After that, the card marks the report
 as stale until the thermostat receives a fresh one. A room already in

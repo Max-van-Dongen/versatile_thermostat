@@ -347,9 +347,9 @@ def test_cold_room_above_learned_cutoff_can_start_then_coast_without_reignition(
 
 def test_forecast_does_not_open_a_room_already_at_its_in_band_cutoff():
     scheduler = PulseScheduler(50, 75, overshoot=0.5, undershoot=0.3)
-    scheduler.restore_learning({**scheduler.dump_learning(), "residual": {"bed": 0.7}})
-    # The floor is 20.2 and the cutoff 20.3. The forecast crosses the floor.
-    above = zone(20.35, target=20.5, demand=1, stamp=1000, slope=-3.6)
+    scheduler.restore_learning({**scheduler.dump_learning(), "residual": {"bed": 0.65}})
+    # The floor is 20.2 and the cutoff 20.35. The forecast crosses the floor.
+    above = zone(20.37, target=20.5, demand=1, stamp=1000, slope=-3.6)
     assert not tick(scheduler, 0, above).valves
     assert not tick(scheduler, 15, above).valves
     below = zone(20.25, target=20.5, demand=1, stamp=1060, slope=-3.6)
@@ -402,3 +402,78 @@ def test_burner_rest_observes_coast_until_room_needs_heat_again(needs_heat):
         step(430, 21.2)
         step(500, 21.0)
         assert scheduler.dump_learning()["residual"]["bed"] == pytest.approx(0.65 * 0.1 + 0.35 * 1.6)
+
+
+def bedroom_scheduler(residual):
+    scheduler = PulseScheduler(50, 75, overshoot=0.5, undershoot=0.3)
+    scheduler.restore_learning({**scheduler.dump_learning(), "residual": {"bed": residual}})
+    return scheduler
+
+
+@pytest.mark.parametrize("residual", [0.7, 0.78, 0.8, 0.9])
+def test_no_valve_motion_for_bedroom_sensor_flicker_at_narrow_cutoff(residual):
+    scheduler = bedroom_scheduler(residual)
+    # The living room is already heating, so a cooling companion could also join.
+    living = zone(18, key="living", opened=True)
+    for t in range(0, 600, 15):
+        temperature = 18.8 if t % 30 == 0 else 18.7
+        bed = zone(temperature, target=19, stamp=1000 + t, slope=-2)
+        plan = tick(scheduler, t, living, bed, on=True)
+        assert plan.valves == {"living"}
+        assert plan.flow_temperature == 75
+
+
+def test_sustained_bedroom_demand_opens_once_and_uses_normal_feedback():
+    scheduler = bedroom_scheduler(0.78)
+    room = zone(18.7, target=19, stamp=4000)
+    for t in range(0, 120, 15):
+        assert not tick(scheduler, t, room).valves
+        assert scheduler.room_decisions["bed"]["reason"] == "waiting_for_stable_demand"
+    # Periodic ticks can qualify sustained demand even for a quiet sensor.
+    plan = tick(scheduler, 120, room)
+    assert plan.valves == {"bed"} and not plan.call_for_heat
+    confirmed = zone(18.7, target=19, opened=True, stamp=4000)
+    assert tick(scheduler, 135, confirmed).flow_temperature == 75
+    assert tick(scheduler, 150, confirmed, on=True).flow_temperature == 75
+    assert not tick(scheduler, 165, zone(19.5, target=19, opened=True, stamp=4165), on=True).valves
+
+
+def test_unheated_cutoff_blocks_reopening_for_three_minutes_including_shared_calls():
+    scheduler = bedroom_scheduler(0.78)
+    cold = zone(18.6, target=19, stamp=1000, slope=-1)
+    assert tick(scheduler, 0, cold).valves == {"bed"}
+    # The thermostat crosses its cutoff before opening/heat was confirmed.
+    assert not tick(scheduler, 15, zone(18.8, target=19, stamp=1015)).valves
+    cold = zone(18.6, target=19, stamp=1030, slope=-1)
+    for t in [30, 120, 194]:
+        assert not scheduler.update(t, [cold], shared_heat_call=True).valves
+        assert scheduler.room_decisions["bed"]["reason"] == "valve_reopen_delay"
+    assert scheduler.update(195, [cold], shared_heat_call=True).valves == {"bed"}
+    assert scheduler.dump_learning()["residual"]["bed"] == 0.78
+
+
+def test_target_increase_can_heat_immediately_during_bedroom_valve_rest():
+    scheduler = bedroom_scheduler(0.78)
+    assert tick(scheduler, 0, zone(18.6, target=19)).valves
+    assert not tick(scheduler, 15, zone(18.8, target=19)).valves
+    boosted = zone(18.8, target=22, recovery=True)
+    assert tick(scheduler, 20, boosted).valves == {"bed"}
+    assert not tick(scheduler, 25, zone(float("nan"), target=22)).valves
+
+
+def test_bedroom_demand_must_remain_cold_through_another_rooms_burner_rest():
+    scheduler = bedroom_scheduler(0.78)
+    living = zone(18, key="living", opened=True)
+
+    def plan(t, temperature, burner=None, on=False):
+        bedroom = zone(temperature, target=19, stamp=1000 + t)
+        return tick(scheduler, t, living, bedroom, water=74, burner=burner, on=on)
+
+    assert plan(0, 18.7).valves == {"living"}
+    plan(10, 18.7, burner=True, on=True)
+    plan(60, 18.7, burner=False, on=True)
+    assert plan(70, 18.7, burner=False, on=True).reason == "burner_reached_flow"
+    assert not plan(100, 18.8).valves
+    assert not plan(360, 18.7).valves
+    assert plan(370, 18.7).valves == {"living"}
+    assert plan(480, 18.7).valves == {"living", "bed"}

@@ -7,6 +7,8 @@ const REASONS = {
   lower_limit_forecast: "Approaching the lower limit",
   joined_cooling: "Joined this run while cooling",
   cutoff_reached: "Reached its predicted cutoff",
+  valve_reopen_delay: "Waiting 3 minutes after closing the valve",
+  waiting_for_stable_demand: "Waiting for 2 minutes at or below the lower limit",
   finished_this_run: "Finished heating in this run",
   waiting_for_shared_call: "Waiting for another room to call",
   insufficient_headroom: "Too close to the upper limit to join",

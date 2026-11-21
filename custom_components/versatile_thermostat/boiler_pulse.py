@@ -13,6 +13,9 @@ MAX_COAST_TIME = 3600    # discard an unresolved peak before unrelated heat can 
 MIN_COAST_TIME = 180
 PEAK_DROP = 0.05        # degrees below the highest post-close measurement
 MIN_PULSE_RISE = 0.1    # measurable warming before ending a pulse that starts above its cutoff
+START_MARGIN = 0.1      # one room-sensor step around the lower comfort limit
+START_SETTLE_TIME = 120
+VALVE_REOPEN_DELAY = 180
 COOLING_RATE = -0.05 / 3600  # degrees per second
 COMPANION_MARGIN = 0.05  # extra degrees of headroom to join an existing run
 MAX_ROOMS = 256
@@ -61,6 +64,8 @@ class RoomHistory:
     has_trend: bool = False
     balance: float = 0.0     # seconds at full reference output
     retry_after: float = 0.0
+    below_limit_since: float | None = None
+    reopen_after: float = 0.0
     coast: CoastObservation | None = None
     pulse_low: float | None = None
     pulse_low_stamp: float | None = None
@@ -235,7 +240,30 @@ class PulseScheduler:
         return (zone.key in self._heated and fresh
                 and zone.current - room.pulse_low >= MIN_PULSE_RISE - 1e-6)
 
+    def _start_delay(self, now, zone):
+        """Qualify a marginal opening without ever delaying a closing command."""
+        room = self._rooms[zone.key]
+        lower = zone.target - self.undershoot
+        if zone.current > lower + 1e-6:
+            room.below_limit_since = None
+        elif room.below_limit_since is None:
+            room.below_limit_since = now
+
+        if now < room.reopen_after:
+            return "valve_reopen_delay"
+        # A learned cutoff can be just one sensor step away from the opening
+        # threshold. Repeated crossings must not keep reversing the motor.
+        if (self._cutoff_temperature(zone) <= lower + START_MARGIN + 1e-6
+                and zone.current > lower - START_MARGIN + 1e-6
+                and (room.below_limit_since is None or now - room.below_limit_since < START_SETTLE_TIME)):
+            return "waiting_for_stable_demand"
+        return None
+
     def _release(self, key, now, zone=None, *, at_cutoff=False):
+        if at_cutoff:
+            room = self._rooms[key]
+            room.reopen_after = now + VALVE_REOPEN_DELAY
+            room.below_limit_since = None
         if zone is not None and key in self._heated:
             self._rooms[key].coast = CoastObservation(
                 now, zone.current, zone.current, zone.current, zone.observed_at, from_cutoff=at_cutoff
@@ -324,11 +352,17 @@ class PulseScheduler:
             for key in self._members.copy():
                 self._release(key, now, zones[key])
 
+        # Keep observing closed rooms even during burner rest. Any warmer
+        # reading breaks a pending two-minute run at the lower limit.
+        candidates = zones.keys() - self._members
+        delays = {key: reason for key in candidates if (reason := self._start_delay(now, zones[key]))}
+        held = {}
         if now >= self._rest_until:
-            candidates = zones.keys() - self._members
             due = {key for key in candidates if self._due(now, zones[key])
                    and (key not in self._finished
                         or zones[key].current <= zones[key].target - self.undershoot + 1e-6)}
+            held = {key: delays[key] for key in due & delays.keys()}
+            due -= delays.keys()
             if due or self._members or shared_heat_call:
                 # One ignition can also serve cooling rooms anywhere inside
                 # their band if there is room for a useful burst plus residual rise.
@@ -337,6 +371,9 @@ class PulseScheduler:
                               and self._slope(zones[key]) <= COOLING_RATE
                               and not self._at_peak(zones[key], margin=COMPANION_MARGIN)}
                 for key in due | companions:
+                    if key in delays:
+                        held[key] = delays[key]
+                        continue
                     self._members.add(key)
                     if key in companions:
                         self._admission_reasons[key] = "joined_cooling"
@@ -366,7 +403,7 @@ class PulseScheduler:
         for key, zone in zones.items():
             has_slope = self._rooms[key].has_trend or _number(zone.slope_per_hour)
             self.room_decisions[key] = {
-                "reason": self._room_reason(now, zone),
+                "reason": held.get(key) or self._room_reason(now, zone),
                 "slope_per_hour": round(self._slope(zone) * 3600, 4) if has_slope else None,
                 "lower_temperature": round(zone.target - self.undershoot, 3),
                 "upper_temperature": round(zone.target + self.overshoot, 3),
